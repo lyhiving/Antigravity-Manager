@@ -103,6 +103,8 @@ impl GeminiClient {
                 //         "mode": "VALIDATED"
                 //     }
                 // },
+                // ✅ 暂时移除 tools 以避免 MALFORMED_FUNCTION_CALL 错误, 强制输出文本
+                // "tools": tools, 
                 "sessionId": session_id
             }
         });
@@ -199,13 +201,37 @@ impl GeminiClient {
                             .and_then(|t| t.as_str())
                             .unwrap_or("");
                         
-                        // ✅ 添加日志:记录原始响应
+                        // ✅ 优化日志逻辑
                         if text.is_empty() {
-                            // 记录完整的 candidates 数据,帮助调试
-                            tracing::warn!(
-                                "(Anthropic) Gemini 返回空文本,原始 candidates: {}",
-                                serde_json::to_string(candidates).unwrap_or_else(|_| "无法序列化".to_string())
-                            );
+                            // 检查是否有 thoughtSignature (Gemini 思考过程)
+                            let has_thought = candidates.get(0)
+                                .and_then(|c| c.get("content"))
+                                .and_then(|c| c.get("parts"))
+                                .and_then(|p| p.get(0))
+                                .and_then(|p| p.get("thoughtSignature"))
+                                .is_some();
+                            
+                            // 检查 finishReason
+                            let reason = candidates.get(0)
+                                .and_then(|c| c.get("finishReason"))
+                                .and_then(|f| f.as_str())
+                                .unwrap_or("UNKNOWN");
+
+                            if has_thought {
+                                tracing::debug!("(Anthropic) 收到 thoughtSignature (思考过程), 跳过警告");
+                            } else if reason == "MALFORMED_FUNCTION_CALL" {
+                                tracing::warn!("(Anthropic) Gemini 工具调用失败 (MALFORMED_FUNCTION_CALL), 请尝试禁用工具或简化 Prompt");
+                            } else if reason == "STOP" {
+                                // STOP 但 text 为空,可能是只有 thoughtSignature 但没被解析出来,或者是真正的空响应
+                                tracing::debug!("(Anthropic) 收到空文本 (STOP), 可能是 metadata");
+                            } else {
+                                // 其他情况才警告
+                                tracing::warn!(
+                                    "(Anthropic) Gemini 返回空文本, 原因: {}, 原始 candidates: {}", 
+                                    reason,
+                                    serde_json::to_string(candidates).unwrap_or_else(|_| "无法序列化".to_string())
+                                );
+                            }
                         }
                             
                         let gemini_finish_reason = candidates.get(0)
