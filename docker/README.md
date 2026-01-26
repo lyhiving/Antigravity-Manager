@@ -19,7 +19,8 @@
 docker run -d \
   --name antigravity-manager \
   -p 8045:8045 \
-  -e API_KEY=your-secret-key \
+  -e API_KEY=your-api-key \
+  -e WEB_PASSWORD=your-login-password \
   -v ~/.antigravity_tools:/root/.antigravity_tools \
   lbjlaq/antigravity-manager:latest
 ```
