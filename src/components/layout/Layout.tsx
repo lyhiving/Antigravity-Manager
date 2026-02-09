@@ -3,8 +3,22 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 import Navbar from '../navbar/Navbar';
 import BackgroundTaskRunner from '../common/BackgroundTaskRunner';
 import ToastContainer from '../common/ToastContainer';
+import { useViewStore } from '../../stores/useViewStore';
+import MiniView from './MiniView';
 
 function Layout() {
+    const { isMiniView } = useViewStore();
+
+    if (isMiniView) {
+        return (
+            <>
+                <BackgroundTaskRunner />
+                <ToastContainer />
+                <MiniView />
+            </>
+        );
+    }
+
     return (
         <div className="h-screen flex flex-col bg-[#FAFBFC] dark:bg-base-300">
             {/* 全局窗口拖拽区域 - 使用 JS 手动触发拖拽，解决 HTML 属性失效问题 */}
