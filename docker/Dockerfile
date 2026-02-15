@@ -52,6 +52,7 @@ RUN apt-get update && apt-get install -y \
     golang-go \
     clang \
     libclang-dev \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 # Use Aliyun mirror for Cargo if needed (Sparse Index)
