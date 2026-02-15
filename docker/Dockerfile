@@ -47,6 +47,9 @@ RUN apt-get update && apt-get install -y \
     librsvg2-dev \
     libsoup-3.0-dev \
     libjavascriptcoregtk-4.1-dev \
+    perl \
+    cmake \
+    golang-go \
     && rm -rf /var/lib/apt/lists/*
 
 # Use Aliyun mirror for Cargo if needed (Sparse Index)
