@@ -46,7 +46,6 @@ struct Tier {
     #[allow(dead_code)]
     #[serde(rename = "quotaTier")]
     quota_tier: Option<String>,
-    #[allow(dead_code)]
     name: Option<String>,
     #[allow(dead_code)]
     slug: Option<String>,
@@ -93,10 +92,11 @@ async fn fetch_project_id(access_token: &str, email: &str, account_id: Option<&s
                 if let Ok(data) = res.json::<LoadProjectResponse>().await {
                     let project_id = data.project_id.clone();
                     
-                    // Core logic: Priority to subscription ID from paid_tier, which better reflects actual account benefits than current_tier
-                    let subscription_tier = data.paid_tier
-                        .and_then(|t| t.id)
-                        .or_else(|| data.current_tier.and_then(|t| t.id));
+                    // Core logic: Priority to subscription name from paid_tier, which better reflects actual account benefits than current_tier id
+                    let subscription_tier = data.paid_tier.as_ref().and_then(|t| t.name.clone())
+                        .or_else(|| data.paid_tier.as_ref().and_then(|t| t.id.clone()))
+                        .or_else(|| data.current_tier.as_ref().and_then(|t| t.name.clone()))
+                        .or_else(|| data.current_tier.as_ref().and_then(|t| t.id.clone()));
                     
                     if let Some(ref tier) = subscription_tier {
                         crate::modules::logger::log_info(&format!(
