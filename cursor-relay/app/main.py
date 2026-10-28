@@ -33,12 +33,23 @@ def _unauthorized() -> HTTPException:
 
 
 def admin_auth(authorization: str | None = Header(default=None)) -> None:
+    """Basic(独立 admin 页) 或 Bearer(内嵌到 Manager 控制台的 tab) 任一都放行。"""
     if not ADMIN_PASSWORD:
         return
-    if not authorization or not authorization.lower().startswith("basic "):
+    if not authorization:
         raise _unauthorized()
+    scheme, _, credential = authorization.partition(" ")
+    scheme = scheme.lower()
+
+    if scheme == "bearer":
+        if secrets.compare_digest(credential.strip(), ADMIN_PASSWORD):
+            return
+        raise _unauthorized()
+    if scheme != "basic":
+        raise _unauthorized()
+
     try:
-        decoded = base64.b64decode(authorization[6:]).decode("utf-8")
+        decoded = base64.b64decode(credential).decode("utf-8")
     except Exception:
         raise _unauthorized()
     _user, _, password = decoded.partition(":")

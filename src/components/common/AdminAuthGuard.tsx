@@ -19,32 +19,32 @@ export const AdminAuthGuard: React.FC<{ children: React.ReactNode }> = ({ childr
     useEffect(() => {
         if (isTauri()) return;
 
-        // 检查 Session 存储 (优先)
-        const sessionKey = sessionStorage.getItem('abv_admin_api_key');
-        if (sessionKey) {
-            setIsAuthenticated(true);
-            setApiKey(sessionKey);
-            return;
-        }
-
-        // 检查本地存储 (迁移逻辑)
-        const savedKey = localStorage.getItem('abv_admin_api_key');
-        if (savedKey) {
-            // 迁移到 sessionStorage 并清理 localStorage
-            sessionStorage.setItem('abv_admin_api_key', savedKey);
-            localStorage.removeItem('abv_admin_api_key');
-            setIsAuthenticated(true);
-            setApiKey(savedKey);
-        }
-
-        // 监听全局 401 事件
+        // 监听全局 401 事件。必须无条件注册：一旦在这里因为"已有 key"提前 return，
+        // 残留的错误 key 就再也清不掉，界面一直是"已登录"但所有接口 401，刷新也回不到登录页。
         const handleUnauthorized = () => {
             sessionStorage.removeItem('abv_admin_api_key');
             localStorage.removeItem('abv_admin_api_key'); // 双重清理确保万一
             setIsAuthenticated(false);
         };
-
         window.addEventListener('abv-unauthorized', handleUnauthorized);
+
+        // 检查 Session 存储 (优先)
+        const sessionKey = sessionStorage.getItem('abv_admin_api_key');
+        if (sessionKey) {
+            setIsAuthenticated(true);
+            setApiKey(sessionKey);
+        } else {
+            // 检查本地存储 (迁移逻辑)
+            const savedKey = localStorage.getItem('abv_admin_api_key');
+            if (savedKey) {
+                // 迁移到 sessionStorage 并清理 localStorage
+                sessionStorage.setItem('abv_admin_api_key', savedKey);
+                localStorage.removeItem('abv_admin_api_key');
+                setIsAuthenticated(true);
+                setApiKey(savedKey);
+            }
+        }
+
         return () => window.removeEventListener('abv-unauthorized', handleUnauthorized);
     }, []);
 
@@ -57,10 +57,8 @@ export const AdminAuthGuard: React.FC<{ children: React.ReactNode }> = ({ childr
         setError('');
 
         try {
-            // 先临时存储 key，用于验证请求
-            sessionStorage.setItem('abv_admin_api_key', trimmedKey);
-
-            // 调用一个需要认证的 API 来验证密码是否正确
+            // 验证通过前不落盘：key 只在确定正确后才写入存储。以前先存后验，
+            // 校验失败/网络失败会留下一个残 key，刷新后直接被当成"已登录"。
             const response = await fetch('/api/accounts', {
                 method: 'GET',
                 headers: {
@@ -71,22 +69,17 @@ export const AdminAuthGuard: React.FC<{ children: React.ReactNode }> = ({ childr
             });
 
             if (response.ok || response.status === 204) {
-                // 验证成功
+                sessionStorage.setItem('abv_admin_api_key', trimmedKey);
                 localStorage.removeItem('abv_admin_api_key');
                 setIsAuthenticated(true);
-                window.location.reload();
             } else if (response.status === 401) {
-                // 密码错误
-                sessionStorage.removeItem('abv_admin_api_key');
                 setError(t('login.error_invalid_key'));
             } else {
-                // 其他错误，但可能密码是对的
-                setIsAuthenticated(true);
-                window.location.reload();
+                // 非 401 的错误不能当作登录成功，否则又进死循环
+                setError(t('login.error_network'));
             }
         } catch (err) {
             // 网络错误等
-            sessionStorage.removeItem('abv_admin_api_key');
             setError(t('login.error_network'));
         } finally {
             setIsLoading(false);

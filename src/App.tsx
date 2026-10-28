@@ -11,6 +11,7 @@ import Security from './pages/Security';
 import ThemeManager from './components/common/ThemeManager';
 import UserToken from './pages/UserToken';
 import { ApiKeyFun } from './pages/ApiKeyFun';
+import CursorRelay from './pages/CursorRelay';
 import { UpdateNotification } from './components/UpdateNotification';
 import SuggestionDeleteThinkingModal from './components/common/SuggestionDeleteThinkingModal';
 import DebugConsole from './components/debug/DebugConsole';
@@ -63,6 +64,10 @@ const router = createBrowserRouter([
       {
         path: 'apikey-fun',
         element: <ApiKeyFun />,
+      },
+      {
+        path: 'cursor-relay',
+        element: <CursorRelay />,
       },
       {
         path: 'security',
