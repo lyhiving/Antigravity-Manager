@@ -1,5 +1,5 @@
-# s303 部署覆盖文件，与主栈一起使用：
-#   docker compose -f docker/docker-compose.yml -f cursor-relay/docker-compose.yml up -d
+# s303 独立栈（与主栈并行，不共用 compose 项目）：
+#   cd /data/cursor-relay && docker compose up -d
 #
 # 主栈用 network_mode: host，relay 同样走 host，直接占用 8317。
 # 与 antigravity-manager 共用 ABV_DATA_DIR，卡池数据落在 <数据目录>/cursor/cards.json。
@@ -11,6 +11,19 @@ services:
     pull_policy: always
     network_mode: host
     restart: unless-stopped
+    # 本机 docker-default 会挡住 socketpair，主栈同样关掉这两层沙箱
+    security_opt:
+      - apparmor:unconfined
+      - seccomp:unconfined
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+      - 1.0.0.1
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: '3'
     environment:
       KYA_PROXY_HOST: 0.0.0.0
       KYA_PROXY_PORT: "8317"

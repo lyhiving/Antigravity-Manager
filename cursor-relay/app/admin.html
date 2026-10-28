@@ -103,6 +103,9 @@ function render(d){
     </div>`).join('');
 }
 
+// 页面可能挂在 /cursor/ 之类的反向代理前缀下，按当前路径推导接口根
+const API = location.pathname.replace(/\/admin\/?$/, '') + '/admin/api';
+
 async function api(path, body){
   const res = await fetch(path, {
     method: body === undefined ? 'GET' : 'POST',
@@ -118,7 +121,7 @@ async function api(path, body){
 }
 
 async function load(){
-  try{ render(await api('/admin/api/state')); }
+  try{ render(await api(API + '/state')); }
   catch(e){ $('s-status').textContent = '读取失败: ' + e.message; $('s-status').className = 'v err'; }
 }
 
@@ -129,8 +132,8 @@ document.addEventListener('click', async ev => {
   busy = true;
   try{
     render(use !== undefined
-      ? await api('/admin/api/active', {index: Number(use)})
-      : await api('/admin/api/cards/delete', {index: Number(del)}));
+      ? await api(API + '/active', {index: Number(use)})
+      : await api(API + '/cards/delete', {index: Number(del)}));
   }catch(e){ alert(e.message); }
   busy = false;
 });
@@ -139,14 +142,14 @@ $('add').onclick = async () => {
   const code = $('new-code').value.trim();
   if(!code) return;
   try{
-    render(await api('/admin/api/cards', {cardCode: code, email: $('new-email').value.trim()}));
+    render(await api(API + '/cards', {cardCode: code, email: $('new-email').value.trim()}));
     $('new-code').value = ''; $('new-email').value = '';
   }catch(e){ alert(e.message); }
 };
 
 $('renew').onclick = async () => {
   $('renew').disabled = true;
-  try{ render(await api('/admin/api/renew', {})); }catch(e){ alert(e.message); }
+  try{ render(await api(API + '/renew', {})); }catch(e){ alert(e.message); }
   $('renew').disabled = false;
 };
 
