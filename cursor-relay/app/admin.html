@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Cursor 中转</title>
+<style>
+  :root{--bg:#0e1116;--card:#161b22;--line:#262d36;--fg:#e6edf3;--dim:#8b949e;--ok:#3fb950;--err:#f85149;--warn:#d29922;--accent:#388bfd}
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  body{margin:0;padding:12px;background:var(--bg);color:var(--fg);font:15px/1.5 -apple-system,system-ui,"PingFang SC",sans-serif;overflow-x:hidden}
+  h1{font-size:17px;margin:4px 0 12px;display:flex;align-items:center;justify-content:space-between}
+  .box{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px;margin-bottom:10px}
+  .row{display:flex;gap:8px;align-items:baseline;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--line);min-height:44px}
+  .row:last-child{border-bottom:0}
+  .k{color:var(--dim);font-size:13px;flex:0 0 auto}
+  .v{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;text-align:right;word-break:break-all}
+  .ok{color:var(--ok)}.err{color:var(--err)}.warn{color:var(--warn)}
+  input,button{font:inherit;border-radius:10px;min-height:44px}
+  input{width:100%;padding:10px 12px;background:#0b0e13;border:1px solid var(--line);color:var(--fg);margin-bottom:8px}
+  button{padding:10px 14px;background:var(--accent);border:0;color:#fff;font-weight:600}
+  button.ghost{background:#21262d;color:var(--fg);border:1px solid var(--line)}
+  button.danger{background:#3d1418;color:#ffb3ab;border:1px solid #5e2026}
+  button:disabled{opacity:.5}
+  .card-item{padding:10px 0;border-bottom:1px solid var(--line)}
+  .card-item:last-child{border-bottom:0}
+  .card-head{display:flex;justify-content:space-between;align-items:center;gap:8px;min-height:44px}
+  .badge{font-size:11px;padding:2px 8px;border-radius:999px;background:#1f2a37;color:var(--dim)}
+  .badge.on{background:#13351d;color:var(--ok)}
+  .actions{display:flex;gap:8px;margin-top:8px}
+  .actions button{flex:1;min-height:44px;padding:8px}
+  .hint{color:var(--dim);font-size:12px;margin:6px 0 0}
+</style>
+</head>
+<body>
+<h1><span>Cursor 中转</span><button class="ghost" id="refresh" style="min-height:36px;padding:6px 12px">刷新</button></h1>
+
+<div class="box" id="state">
+  <div class="row"><span class="k">状态</span><span class="v" id="s-status">—</span></div>
+  <div class="row"><span class="k">详情</span><span class="v" id="s-msg">—</span></div>
+  <div class="row"><span class="k">当前凭证</span><span class="v" id="s-token">—</span></div>
+  <div class="row"><span class="k">设备 ID</span><span class="v" id="s-device">—</span></div>
+</div>
+
+<div class="box">
+  <button id="renew" style="width:100%">立即续杯</button>
+</div>
+
+<div class="box">
+  <div style="font-weight:600;margin-bottom:6px">卡池</div>
+  <div id="cards"><p class="hint">暂无卡密</p></div>
+</div>
+
+<div class="box">
+  <div style="font-weight:600;margin-bottom:8px">添加卡密</div>
+  <input id="new-email" placeholder="邮箱（备注用，可空）" autocomplete="off">
+  <input id="new-code" placeholder="卡密" autocomplete="off">
+  <button id="add" style="width:100%">添加</button>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let busy = false;
+
+function statusClass(s){
+  return s === 'success' ? 'ok' : (s === 'error' ? 'err' : 'warn');
+}
+function esc(v){
+  return String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function ago(ms){
+  if(!ms) return '';
+  const d = Math.floor(Date.now()/1000 - ms);
+  if(d < 60) return '刚刚';
+  if(d < 3600) return Math.floor(d/60)+' 分钟前';
+  if(d < 86400) return Math.floor(d/3600)+' 小时前';
+  return Math.floor(d/86400)+' 天前';
+}
+
+function render(d){
+  const st = d.state || {};
+  $('s-status').textContent = st.status || '待命';
+  $('s-status').className = 'v ' + statusClass(st.status);
+  $('s-msg').textContent = st.message || '—';
+  $('s-token').textContent = d.activeToken || '未设置';
+  $('s-device').textContent = d.deviceId || '—';
+
+  const box = $('cards');
+  if(!d.cards.length){
+    box.innerHTML = '<p class="hint">暂无卡密</p>';
+    return;
+  }
+  box.innerHTML = d.cards.map(c => `
+    <div class="card-item">
+      <div class="card-head">
+        <span>${esc(c.email || '未命名')} ${c.active ? '<span class="badge on">当前</span>' : '<span class="badge">#'.concat(c.index + 1, '</span>')}</span>
+        <span class="badge">${esc(c.cardType)}</span>
+      </div>
+      <div class="k" style="margin-top:4px">${esc(c.cardCode)} · 续杯 ${c.renewCount} 次${c.lastRenewAt ? ' · ' + ago(c.lastRenewAt) : ''}</div>
+      <div class="actions">
+        <button class="ghost" data-use="${c.index}" ${c.active ? 'disabled' : ''}>设为当前</button>
+        <button class="danger" data-del="${c.index}">删除</button>
+      </div>
+    </div>`).join('');
+}
+
+async function api(path, body){
+  const res = await fetch(path, {
+    method: body === undefined ? 'GET' : 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: body === undefined ? undefined : JSON.stringify(body)
+  });
+  if(!res.ok){
+    let msg = res.status;
+    try{ msg = (await res.json()).detail || msg; }catch(e){}
+    throw new Error(msg);
+  }
+  return res.json();
+}
+
+async function load(){
+  try{ render(await api('/admin/api/state')); }
+  catch(e){ $('s-status').textContent = '读取失败: ' + e.message; $('s-status').className = 'v err'; }
+}
+
+document.addEventListener('click', async ev => {
+  const use = ev.target.dataset.use, del = ev.target.dataset.del;
+  if(use === undefined && del === undefined) return;
+  if(busy) return;
+  busy = true;
+  try{
+    render(use !== undefined
+      ? await api('/admin/api/active', {index: Number(use)})
+      : await api('/admin/api/cards/delete', {index: Number(del)}));
+  }catch(e){ alert(e.message); }
+  busy = false;
+});
+
+$('add').onclick = async () => {
+  const code = $('new-code').value.trim();
+  if(!code) return;
+  try{
+    render(await api('/admin/api/cards', {cardCode: code, email: $('new-email').value.trim()}));
+    $('new-code').value = ''; $('new-email').value = '';
+  }catch(e){ alert(e.message); }
+};
+
+$('renew').onclick = async () => {
+  $('renew').disabled = true;
+  try{ render(await api('/admin/api/renew', {})); }catch(e){ alert(e.message); }
+  $('renew').disabled = false;
+};
+
+$('refresh').onclick = load;
+load();
+setInterval(load, 5000);
+</script>
+</body>
+</html>
