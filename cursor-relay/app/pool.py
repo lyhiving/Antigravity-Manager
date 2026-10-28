@@ -25,17 +25,22 @@ import os
 import threading
 import time
 import urllib.request
+import uuid
 from pathlib import Path
 
 DATA_ROOT = Path(
     os.environ.get("ABV_DATA_DIR") or (Path.home() / ".antigravity_tools")
 ) / "cursor"
 CARDS_FILE = DATA_ROOT / "cards.json"
+HISTORY_FILE = DATA_ROOT / "renewal_history.json"
+HISTORY_LIMIT = 200
+SNAPSHOT_HISTORY = 20
 
 TK_DIR = Path.home() / ".cursor-tk"
 ACTIVE_TOKEN = TK_DIR / "active_token"
 STATE_FILE = TK_DIR / "kya_switch_state.json"
-DEVICE_ID_FILE = Path.home() / ".cursor-renewal" / "device_id.txt"
+# 放在 ABV_DATA_DIR 下（已挂载持久卷），否则重置后的指纹会随容器重建丢失并退回默认值
+DEVICE_ID_FILE = DATA_ROOT / "device_id.txt"
 
 DEFAULT_DEVICE_ID = "D6CDA11D-E07A-5B09-BE57-B3AD55284470"
 HOSTS = ("https://www.skhxd.top", "https://www.xxdlzs.cn")
@@ -107,6 +112,41 @@ def device_id() -> str:
     except Exception:
         pass
     return DEFAULT_DEVICE_ID
+
+
+def reset_device_id() -> tuple[str, str]:
+    """Regenerate the fingerprint sent with card activation (KYA 重置机器码 等价操作).
+
+    Linux 侧没有 Cursor 客户端可改写，唯一被激活接口读取的指纹就是
+    device_id.txt，所以这里生成全新 UUID、备份旧值后落盘。返回 (new, old)。
+    """
+    try:
+        old = DEVICE_ID_FILE.read_text(encoding="utf-8").strip() if DEVICE_ID_FILE.is_file() else ""
+    except Exception:
+        old = ""
+    if old:
+        backup = DEVICE_ID_FILE.with_name(
+            f"device_id.txt.bak.{time.strftime('%Y%m%d_%H%M%S')}"
+        )
+        try:
+            backup.write_text(old, encoding="utf-8")
+        except Exception:
+            pass
+    new = str(uuid.uuid4()).upper()
+    DEVICE_ID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    DEVICE_ID_FILE.write_text(new, encoding="utf-8")
+    return new, old
+
+
+def load_history() -> list:
+    raw = _read_json(HISTORY_FILE, [])
+    return [e for e in raw if isinstance(e, dict)] if isinstance(raw, list) else []
+
+
+def add_history(entry: dict) -> None:
+    items = load_history()
+    items.insert(0, entry)
+    _write_json(HISTORY_FILE, items[:HISTORY_LIMIT])
 
 
 def read_active_token() -> str:
@@ -216,6 +256,15 @@ def _worker() -> None:
         ok, _token, detail = renew_next_card()
     except Exception as exc:
         ok, detail = False, f"{type(exc).__name__}: {exc}"
+    add_history(
+        {
+            "at": int(time.time()),
+            "ok": ok,
+            "card": detail if ok else "",
+            "message": "" if ok else detail,
+            "deviceId": device_id(),
+        }
+    )
     write_state("success" if ok else "error", detail)
     print(
         f"[cursor-relay] renewal {'ok' if ok else 'failed'}: {detail}",
@@ -298,4 +347,5 @@ def snapshot() -> dict:
         "deviceId": device_id(),
         "state": read_state(),
         "renewing": _running,
+        "history": load_history()[:SNAPSHOT_HISTORY],
     }

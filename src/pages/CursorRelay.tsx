@@ -14,11 +14,20 @@ interface RelayCard {
     lastRenewAt: number | null;
 }
 
+interface RelayHistory {
+    at: number;
+    ok: boolean;
+    card: string;
+    message: string;
+    deviceId?: string;
+}
+
 interface RelayState {
     state?: { status?: string; message?: string };
     activeToken?: string;
     deviceId?: string;
     cards: RelayCard[];
+    history?: RelayHistory[];
 }
 
 // 生产环境由 nginx 把 /cursor/ 反代到 relay(8317)；本地开发可用 VITE_CURSOR_RELAY_BASE 覆盖
@@ -55,6 +64,8 @@ const ago = (sec?: number | null) => {
     if (d < 86400) return `${Math.floor(d / 3600)} 小时前`;
     return `${Math.floor(d / 86400)} 天前`;
 };
+
+const fmtTime = (sec: number) => new Date(sec * 1000).toLocaleString();
 
 const CursorRelay: React.FC = () => {
     const { t } = useTranslation();
@@ -106,8 +117,14 @@ const CursorRelay: React.FC = () => {
         setEmail('');
     };
 
+    const resetDevice = () => {
+        if (!window.confirm(t('cursor_relay.reset_device_confirm', '将生成全新的随机设备 ID 并备份旧值，之后的续杯使用新指纹。是否确认重置？'))) return;
+        run('/device/reset', {}, t('cursor_relay.reset_device_done', '设备 ID 已重置'));
+    };
+
     const status = data?.state?.status;
     const cards = data?.cards ?? [];
+    const history = data?.history ?? [];
 
     return (
         <motion.div
@@ -159,6 +176,15 @@ const CursorRelay: React.FC = () => {
                 {t('cursor_relay.renew_now', '立即续杯')}
             </button>
 
+            <button
+                onClick={resetDevice}
+                disabled={busy}
+                className="w-full mt-2 min-h-11 rounded-xl border border-gray-200 dark:border-base-200 text-sm font-medium text-gray-700 dark:text-gray-300 flex items-center justify-center gap-2 disabled:opacity-50"
+            >
+                <RefreshCw size={16} />
+                {t('cursor_relay.reset_device', '重置设备 ID')}
+            </button>
+
             <div className="mt-4">
                 <div className="font-semibold text-sm text-gray-700 dark:text-gray-300 mb-2">
                     {t('cursor_relay.pool', '卡池')} <span className="text-gray-400 font-normal">({cards.length})</span>
@@ -206,6 +232,36 @@ const CursorRelay: React.FC = () => {
                                     {t('cursor_relay.delete', '删除')}
                                 </button>
                             </div>
+                        </div>
+                    ))}
+                </div>
+            </div>
+
+            <div className="mt-4">
+                <div className="font-semibold text-sm text-gray-700 dark:text-gray-300 mb-2">
+                    {t('cursor_relay.history', '续杯记录')} <span className="text-gray-400 font-normal">({history.length})</span>
+                </div>
+                <div className="bg-white dark:bg-base-100 rounded-xl shadow-sm border border-gray-100 dark:border-base-200 divide-y divide-gray-100 dark:divide-base-200">
+                    {history.length === 0 && (
+                        <p className="px-4 py-6 text-sm text-center text-gray-400">
+                            {t('cursor_relay.no_history', '暂无续杯记录')}
+                        </p>
+                    )}
+                    {history.map((h, i) => (
+                        <div key={`${h.at}-${i}`} className="px-4 py-3">
+                            <div className="flex items-center justify-between gap-2">
+                                <span className={`text-sm ${h.ok ? 'text-green-600 dark:text-green-400' : 'text-red-500'}`}>
+                                    {h.ok ? t('cursor_relay.history_ok', '成功') : t('cursor_relay.history_fail', '失败')}
+                                    {h.card ? ` · ${h.card}` : ''}
+                                </span>
+                                <span className="text-[11px] text-gray-400 shrink-0">{fmtTime(h.at)}</span>
+                            </div>
+                            {h.message && (
+                                <div className="text-xs text-gray-500 dark:text-gray-400 break-all mt-1">{h.message}</div>
+                            )}
+                            {h.deviceId && (
+                                <div className="text-[11px] text-gray-400 font-mono break-all mt-1">{h.deviceId}</div>
+                            )}
                         </div>
                     ))}
                 </div>

@@ -126,6 +126,16 @@ async def renew_now() -> dict:
     return pool.snapshot()
 
 
+@app.post("/admin/api/device/reset", dependencies=[Depends(admin_auth)])
+async def reset_device() -> dict:
+    if pool.snapshot().get("renewing"):
+        raise HTTPException(status_code=409, detail="续杯中，请稍后再重置设备 ID")
+    new, _old = pool.reset_device_id()
+    snapshot = pool.snapshot()
+    snapshot["state"] = {"status": "success", "message": f"设备 ID 已重置为 {new}"}
+    return snapshot
+
+
 def main() -> None:
     host = os.environ.get("KYA_PROXY_HOST", "0.0.0.0")
     port = int(os.environ.get("KYA_PROXY_PORT", "8317"))

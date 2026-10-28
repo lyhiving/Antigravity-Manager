@@ -13,6 +13,7 @@ import pool
 
 def _isolate(tmp: Path) -> None:
     pool.CARDS_FILE = tmp / "cards.json"
+    pool.HISTORY_FILE = tmp / "renewal_history.json"
     pool.ACTIVE_TOKEN = tmp / ".cursor-tk" / "active_token"
     pool.STATE_FILE = tmp / ".cursor-tk" / "kya_switch_state.json"
     pool.DEVICE_ID_FILE = tmp / "device_id.txt"
@@ -119,6 +120,53 @@ def test_wait_times_out_when_renewal_fails():
         pool.trigger_quota_switch("test")
         assert pool.wait_for_quota_renewal(since, timeout_s=10) is False
         assert pool.read_state()["status"] == "error"
+
+
+def test_reset_device_id_backs_up_and_rotates():
+    with tempfile.TemporaryDirectory() as d:
+        _isolate(Path(d))
+        pool.DEVICE_ID_FILE.parent.mkdir(parents=True, exist_ok=True)
+        pool.DEVICE_ID_FILE.write_text("OLD-ID", encoding="utf-8")
+
+        seen = []
+        pool._post = lambda path, code: (
+            seen.append(pool.device_id()), {"success": True, "token": "N" * 40}
+        )[1]
+        pool.save_pool({"active": 0, "cards": [{"email": "a@x", "cardCode": "A"}]})
+        pool.renew_next_card()
+
+        new, old = pool.reset_device_id()
+        assert old == "OLD-ID" and new != old, (old, new)
+        assert pool.device_id() == new
+        backups = list(pool.DEVICE_ID_FILE.parent.glob("device_id.txt.bak.*"))
+        assert backups and backups[0].read_text(encoding="utf-8") == "OLD-ID", backups
+
+        pool.save_pool({"active": 0, "cards": [{"email": "a@x", "cardCode": "A"}]})
+        pool.renew_next_card()
+        assert seen == ["OLD-ID", new], seen
+
+
+def test_history_records_each_renewal():
+    with tempfile.TemporaryDirectory() as d:
+        _isolate(Path(d))
+        pool.save_pool({"active": 0, "cards": [{"email": "a@x", "cardCode": "A"}]})
+        pool._post = lambda path, code: {"success": True, "token": "Z" * 40}
+        pool._running = False
+        since = time.time() * 1000
+        pool.trigger_quota_switch("test")
+        assert pool.wait_for_quota_renewal(since, timeout_s=10)
+
+        pool.save_pool({"active": 0, "cards": [{"email": "b@x", "cardCode": "B"}]})
+        pool._post = lambda path, code: {"success": False, "message": "无效卡密"}
+        since = time.time() * 1000
+        pool.trigger_quota_switch("test")
+        assert pool.wait_for_quota_renewal(since, timeout_s=10) is False
+
+        history = pool.load_history()
+        assert len(history) == 2, history
+        assert history[0]["ok"] is False and "无效卡密" in history[0]["message"], history[0]
+        assert history[1]["ok"] is True and history[1]["card"] == "a@x", history[1]
+        assert len(pool.snapshot()["history"]) == 2
 
 
 if __name__ == "__main__":
