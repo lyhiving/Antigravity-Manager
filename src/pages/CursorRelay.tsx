@@ -24,10 +24,11 @@ interface RelayHistory {
 }
 
 interface RelayState {
-    state?: { status?: string; message?: string };
+    state?: { status?: string; message?: string; phase?: string };
     activeToken?: string;
     deviceId?: string;
     cards: RelayCard[];
+    daily?: { date: string; switches: number; resets: number; total: number; remaining: number; cooldownRemaining: number };
     history?: RelayHistory[];
 }
 
@@ -160,6 +161,12 @@ const CursorRelay: React.FC = () => {
                     [t('cursor_relay.detail', '详情'), data?.state?.message || '—'],
                     [t('cursor_relay.active_token', '当前凭证'), data?.activeToken || t('cursor_relay.not_set', '未设置')],
                     [t('cursor_relay.device_id', '设备 ID'), data?.deviceId || '—'],
+                    [
+                        t('cursor_relay.daily', '今日换号'),
+                        data?.daily
+                            ? `${data.daily.switches}/${data.daily.total} · ${t('cursor_relay.remaining', '剩余')} ${data.daily.remaining}`
+                            : '—',
+                    ],
                 ].map(([k, v], i) => (
                     <div key={i} className="flex items-start justify-between gap-3 px-4 py-3">
                         <span className="text-sm text-gray-500 dark:text-gray-400 shrink-0">{k as string}</span>

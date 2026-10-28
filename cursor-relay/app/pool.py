@@ -53,10 +53,17 @@ USER_AGENT = (
 )
 
 WAIT_TIMEOUT_S = float(os.environ.get("CURSOR_RENEW_WAIT_S", "120"))
-HTTP_TIMEOUT_S = float(os.environ.get("CURSOR_RENEW_HTTP_S", "20"))
+# KYA 的 timeoutInterval 是 6.0
+HTTP_TIMEOUT_S = float(os.environ.get("CURSOR_RENEW_HTTP_S", "6"))
+# KYA cooldownDurationSeconds 官方值 30s（旧版 180 已废弃）
+COOLDOWN_S = float(os.environ.get("CURSOR_RENEW_COOLDOWN_S", "30"))
+# KYA 首次失败后的静默退避重试
+RETRY_SLEEP_S = 1.0
+DAILY_FILE = DATA_ROOT / "daily_switch.json"
 
 _guard = threading.Lock()
 _running = False
+_last_switch_at = 0.0
 
 
 # ---------------------------------------------------------------- fs helpers
@@ -81,13 +88,15 @@ def read_state() -> dict:
     return st if isinstance(st, dict) else {}
 
 
-def write_state(status: str, detail: str = "") -> None:
+def write_state(status: str, detail: str = "", phase: str = "") -> None:
     _write_json(
         STATE_FILE,
         {
             "status": status,
+            "phase": phase,
             "message": detail,
             "timestamp": int(time.time() * 1000),
+            "pid": os.getpid(),
         },
     )
 
@@ -154,6 +163,27 @@ def add_history(entry: dict) -> None:
     _write_json(HISTORY_FILE, items[:HISTORY_LIMIT])
 
 
+def load_daily() -> dict:
+    raw = _read_json(DAILY_FILE, {})
+    today = time.strftime("%Y-%m-%d")
+    if not isinstance(raw, dict) or raw.get("date") != today:
+        return {"date": today, "switches": 0, "resets": 0}
+    return raw
+
+
+def bump_daily(field: str, delta: int = 1) -> dict:
+    daily = load_daily()
+    daily[field] = max(0, int(daily.get(field) or 0) + delta)
+    _write_json(DAILY_FILE, daily)
+    return daily
+
+
+def effective_daily_total(daily: dict) -> int:
+    """KYA: (max(重置次数, 换号次数//60) + 1) * 60 —— 每次充能重置 +60 次换号额度。"""
+    resets = max(int(daily.get("resets") or 0), int(daily.get("switches") or 0) // 60)
+    return (resets + 1) * 60
+
+
 def read_active_token() -> str:
     try:
         if ACTIVE_TOKEN.is_file():
@@ -170,9 +200,11 @@ def write_active_token(token: str) -> None:
 
 # --------------------------------------------------------------- renewal api
 def _post(path: str, card_code: str) -> dict:
+    """与 KYA requestRenewalApiWithCardCode 一致：失败才走容灾备用节点。"""
     body = json.dumps(
         {"cardCode": card_code, "deviceId": device_id()}
     ).encode("utf-8")
+    last: dict | None = None
     last_error = ""
     for host in HOSTS:
         try:
@@ -188,11 +220,21 @@ def _post(path: str, card_code: str) -> dict:
             with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S) as resp:
                 payload = resp.read().decode("utf-8", "ignore").strip() or "{}"
             parsed = json.loads(payload)
-            if isinstance(parsed, dict):
+            if not isinstance(parsed, dict):
+                last_error = "non-object response"
+                continue
+            last = parsed
+            # 成功 / 已含 token / 额度已满 => 直接返回，不再尝试备用节点
+            if (
+                parsed.get("success")
+                or len(_token_of(parsed)) > 20
+                or parsed.get("limitReached")
+            ):
                 return parsed
-            last_error = "non-object response"
         except Exception as exc:  # network error or bad JSON -> try next host
             last_error = f"{type(exc).__name__}: {exc}"
+    if last is not None:
+        return last
     return {"success": False, "message": f"所有服务节点均无法连接 ({last_error})"}
 
 
@@ -200,36 +242,44 @@ def _token_of(res: dict) -> str:
     return str(res.get("token") or "").strip()
 
 
+def _ok(res: dict) -> bool:
+    """KYA: success && token.length > 20 才算换号成功。"""
+    return bool(res.get("success")) and len(_token_of(res)) > 20
+
+
 def renew_card(card: dict) -> tuple[bool, str, str]:
     """Renew one card. Returns (ok, token, message)."""
     code = str(card.get("cardCode") or "")
 
     res = _post(R1_PATH, code)
-    token = _token_of(res)
-    if len(token) > 20:
-        return True, token, ""
-
     if res.get("limitReached"):
+        write_state(
+            "resetting",
+            "卡密今日额度已满，正在自动扣时长充能重置额度(+60次)...",
+            "requesting_rs1",
+        )
         rs = _post(RS1_PATH, code)
-        token = _token_of(rs)
-        if len(token) > 20:
-            return True, token, "reset"
-        if rs.get("success"):
-            res = _post(R1_PATH, code)
-            token = _token_of(res)
-            if len(token) > 20:
-                return True, token, "reset+renew"
-            return False, "", str(res.get("message") or "充能后换杯失败")
-        return False, "", str(rs.get("message") or "充能重置失败")
+        if _ok(rs):
+            bump_daily("resets")
+            return True, _token_of(rs), "reset"
+        # KYA: 扣时长重置未通过 -> 直接轮换备用卡密，不再重试本卡
+        return False, "", str(rs.get("message") or "扣时长重置未通过")
 
-    return False, "", str(res.get("message") or "换杯失败")
+    if _ok(res):
+        return True, _token_of(res), ""
+
+    # KYA: 首次未成功 -> 1s 静默退避重试
+    time.sleep(RETRY_SLEEP_S)
+    res = _post(R1_PATH, code)
+    if _ok(res):
+        return True, _token_of(res), ""
+    return False, "", str(res.get("message") or "云端 API 换号未返回有效凭据")
 
 
 def renew_next_card() -> tuple[bool, str, str]:
     """Walk the pool from the active card; first success wins.
 
-    Per policy: a failed key must not end the session — try the whole pool,
-    and only surface failure once every key has been tried.
+    与 KYA rotateToNextCard 一致：只向后轮换、不绕回池首；池尾仍失败才报错。
     """
     pool = load_pool()
     cards = pool["cards"]
@@ -238,8 +288,7 @@ def renew_next_card() -> tuple[bool, str, str]:
 
     start = pool.get("active", 0) % len(cards)
     errors = []
-    for offset in range(len(cards)):
-        idx = (start + offset) % len(cards)
+    for idx in range(start, len(cards)):
         card = cards[idx]
         label = str(card.get("email") or f"#{idx}")
         try:
@@ -249,6 +298,9 @@ def renew_next_card() -> tuple[bool, str, str]:
         if ok:
             card["lastRenewAt"] = int(time.time())
             card["renewCount"] = int(card.get("renewCount") or 0) + 1
+            if idx != start:
+                # KYA: 轮换到备用卡密后今日换号计数清零
+                bump_daily("switches", -10**9)
             pool["active"] = idx
             save_pool(pool)
             write_active_token(token)
@@ -274,7 +326,11 @@ def _worker(reason: str = "manual") -> None:
             "reason": reason,
         }
     )
-    write_state("success" if ok else "error", detail)
+    write_state(
+        "success" if ok else "error",
+        "极速换号完成" if ok else detail,
+        "completed" if ok else "failed",
+    )
     print(
         f"[cursor-relay] renewal {'ok' if ok else 'failed'} ({reason}): {detail}",
         flush=True,
@@ -284,18 +340,42 @@ def _worker(reason: str = "manual") -> None:
 
 
 def trigger_quota_switch(session_name: str = "cursor-relay") -> None:
-    """Kick off a renewal in the background (mirrors the KYA signal file)."""
-    global _running
-    # reason: 控制台按钮触发=manual，聊天撞到额度上限自动换号=auto
+    """KYA executeSwitchWithReason：防封冷却门控 -> 计数 -> 异步换号。"""
+    global _running, _last_switch_at
+    # reason: 控制台按钮触发=manual，聊天撞到额度上限自动换号=auto（KYA 的 Quota 类原因）
     reason = "manual" if session_name == "cursor-admin" else "auto"
+
+    now = time.time()
+    if _last_switch_at > 0 and (now - _last_switch_at) < COOLDOWN_S:
+        remain = int(COOLDOWN_S - (now - _last_switch_at))
+        if reason == "auto":
+            # KYA: Quota/耗尽 类原因排队，冷却结束后自动重入
+            print(
+                f"[cursor-relay] ⏳ 遇到防封冷却（还需 {remain} 秒），已排队等待冷却后自动执行换号...",
+                flush=True,
+            )
+            timer = threading.Timer(remain + 1, trigger_quota_switch, (session_name,))
+            timer.daemon = True
+            timer.start()
+            return
+        # KYA: 手动触发在冷却期内直接跳过
+        detail = f"防封冷却中（还需等待 {remain} 秒），跳过换号触发"
+        print(f"[cursor-relay] ⏳ {detail}", flush=True)
+        write_state("skipped", detail, "cooldown")
+        return
+
     with _guard:
         if _running:
             print("[cursor-relay] renewal already in progress, coalescing", flush=True)
             return
         _running = True
-    write_state("switching", session_name)
+    _last_switch_at = now
+    # KYA: 换号额度由云端权威控制，本地仅计数展示
+    daily = bump_daily("switches")
+    write_state("switching", "正在向云端申请新账号与凭据...", "requesting_api")
     print(
-        f"[cursor-relay] renewal start ({reason}, session={session_name})",
+        f"[cursor-relay] 🚀 执行换号 [{reason}] (今日第 {daily['switches']}/"
+        f"{effective_daily_total(daily)} 次)",
         flush=True,
     )
     threading.Thread(
@@ -357,6 +437,9 @@ def snapshot() -> dict:
                 "active": idx == pool.get("active", 0),
             }
         )
+    daily = load_daily()
+    switches = int(daily.get("switches") or 0)
+    total = effective_daily_total(daily)
     return {
         "cards": cards,
         "activeIndex": pool.get("active", 0),
@@ -364,5 +447,17 @@ def snapshot() -> dict:
         "deviceId": device_id(),
         "state": read_state(),
         "renewing": _running,
+        "daily": {
+            "date": daily["date"],
+            "switches": switches,
+            "resets": int(daily.get("resets") or 0),
+            "total": total,
+            "remaining": max(0, total - switches),
+            "cooldownRemaining": max(
+                0, int(COOLDOWN_S - (time.time() - _last_switch_at))
+            )
+            if _last_switch_at > 0
+            else 0,
+        },
         "history": load_history()[:SNAPSHOT_HISTORY],
     }
