@@ -18,6 +18,9 @@ def _isolate(tmp: Path) -> None:
     pool.STATE_FILE = tmp / ".cursor-tk" / "kya_switch_state.json"
     pool.DEVICE_ID_FILE = tmp / "device_id.txt"
     pool.DAILY_FILE = tmp / "daily_switch.json"
+    pool.AUTO_RENEW_FILE = tmp / "auto_renew.json"
+    # 多数用例走 auto 触发路径，默认打开开关；开关语义本身由专门用例覆盖
+    pool.set_auto_renew(True)
     pool.RETRY_SLEEP_S = 0
     pool.COOLDOWN_S = 0
     pool._last_switch_at = 0.0
@@ -218,6 +221,35 @@ def test_auto_switch_queues_after_cooldown():
         assert pool._running is False, "冷却中应排队而非立即执行"
         assert pool.wait_for_quota_renewal(since, timeout_s=10), pool.read_state()
         assert pool.read_active_token() == "Z" * 40
+
+
+def test_auto_renew_defaults_off_and_only_gates_auto():
+    with tempfile.TemporaryDirectory() as d:
+        _isolate(Path(d))
+        pool.AUTO_RENEW_FILE.unlink(missing_ok=True)
+        assert pool.auto_renew_enabled() is False
+
+        pool.save_pool({"active": 0, "cards": [{"email": "a@x", "cardCode": "A"}]})
+        calls = []
+        pool._post = lambda path, code: (calls.append(path), {"success": True, "token": "Z" * 40})[1]
+
+        pool.trigger_quota_switch("cursor-relay")
+        assert calls == [] and pool._running is False, calls
+        state = pool.read_state()
+        assert state["status"] == "skipped" and state["phase"] == "auto_disabled", state
+        assert pool.snapshot()["autoRenew"] is False
+
+        # 手动续杯不受开关影响
+        since = time.time() * 1000
+        pool.trigger_quota_switch("cursor-admin")
+        assert pool.wait_for_quota_renewal(since, timeout_s=10), pool.read_state()
+
+        # 打开开关后自动路径恢复
+        pool.set_auto_renew(True)
+        assert pool.snapshot()["autoRenew"] is True
+        since = time.time() * 1000
+        pool.trigger_quota_switch("cursor-relay")
+        assert pool.wait_for_quota_renewal(since, timeout_s=10), pool.read_state()
 
 
 def test_daily_counters_and_quota_math():

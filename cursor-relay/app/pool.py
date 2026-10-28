@@ -60,6 +60,8 @@ COOLDOWN_S = float(os.environ.get("CURSOR_RENEW_COOLDOWN_S", "30"))
 # KYA 首次失败后的静默退避重试
 RETRY_SLEEP_S = 1.0
 DAILY_FILE = DATA_ROOT / "daily_switch.json"
+# 自动续杯开关：文件缺省视为关闭（只有管理页显式打开才生效）
+AUTO_RENEW_FILE = DATA_ROOT / "auto_renew.json"
 
 _guard = threading.Lock()
 _running = False
@@ -182,6 +184,16 @@ def effective_daily_total(daily: dict) -> int:
     """KYA: (max(重置次数, 换号次数//60) + 1) * 60 —— 每次充能重置 +60 次换号额度。"""
     resets = max(int(daily.get("resets") or 0), int(daily.get("switches") or 0) // 60)
     return (resets + 1) * 60
+
+
+def auto_renew_enabled() -> bool:
+    raw = _read_json(AUTO_RENEW_FILE, {})
+    return isinstance(raw, dict) and bool(raw.get("enabled"))
+
+
+def set_auto_renew(enabled: bool) -> bool:
+    _write_json(AUTO_RENEW_FILE, {"enabled": bool(enabled), "updatedAt": int(time.time())})
+    return bool(enabled)
 
 
 def read_active_token() -> str:
@@ -345,6 +357,13 @@ def trigger_quota_switch(session_name: str = "cursor-relay") -> None:
     # reason: 控制台按钮触发=manual，聊天撞到额度上限自动换号=auto（KYA 的 Quota 类原因）
     reason = "manual" if session_name == "cursor-admin" else "auto"
 
+    # 自动续杯默认关闭：只有管理页开关打开后才允许聊天撞额度时自动换号
+    if reason == "auto" and not auto_renew_enabled():
+        detail = "自动续杯已关闭，跳过换号"
+        print(f"[cursor-relay] {detail}", flush=True)
+        write_state("skipped", detail, "auto_disabled")
+        return
+
     now = time.time()
     if _last_switch_at > 0 and (now - _last_switch_at) < COOLDOWN_S:
         remain = int(COOLDOWN_S - (now - _last_switch_at))
@@ -446,6 +465,7 @@ def snapshot() -> dict:
         "activeToken": mask(read_active_token()),
         "deviceId": device_id(),
         "state": read_state(),
+        "autoRenew": auto_renew_enabled(),
         "renewing": _running,
         "daily": {
             "date": daily["date"],

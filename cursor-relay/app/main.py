@@ -126,6 +126,12 @@ async def renew_now() -> dict:
     return pool.snapshot()
 
 
+@app.post("/admin/api/auto-renew", dependencies=[Depends(admin_auth)])
+async def set_auto_renew(payload: dict) -> dict:
+    pool.set_auto_renew(bool(payload.get("enabled")))
+    return pool.snapshot()
+
+
 @app.post("/admin/api/device/reset", dependencies=[Depends(admin_auth)])
 async def reset_device() -> dict:
     if pool.snapshot().get("renewing"):

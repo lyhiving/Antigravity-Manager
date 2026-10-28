@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { motion } from 'framer-motion';
-import { MousePointer2, RefreshCw, Zap, Trash2, CheckCircle2, Plus, Loader2 } from 'lucide-react';
+import { MousePointer2, RefreshCw, Zap, Trash2, CheckCircle2, Plus, Loader2, Power } from 'lucide-react';
 import { showToast } from '../components/common/ToastContainer';
 
 interface RelayCard {
@@ -26,6 +26,7 @@ interface RelayHistory {
 interface RelayState {
     state?: { status?: string; message?: string; phase?: string };
     activeToken?: string;
+    autoRenew?: boolean;
     deviceId?: string;
     cards: RelayCard[];
     daily?: { date: string; switches: number; resets: number; total: number; remaining: number; cooldownRemaining: number };
@@ -182,6 +183,28 @@ const CursorRelay: React.FC = () => {
             >
                 {busy ? <Loader2 size={18} className="animate-spin" /> : <Zap size={18} />}
                 {t('cursor_relay.renew_now', '立即续杯')}
+            </button>
+
+            <button
+                onClick={() =>
+                    run(
+                        '/auto-renew',
+                        { enabled: !data?.autoRenew },
+                        data?.autoRenew
+                            ? t('cursor_relay.auto_renew_off', '自动续杯已关闭')
+                            : t('cursor_relay.auto_renew_on', '自动续杯已开启'),
+                    )
+                }
+                disabled={busy}
+                className={`w-full mt-2 min-h-11 rounded-xl border text-sm font-medium flex items-center justify-center gap-2 disabled:opacity-50 ${
+                    data?.autoRenew
+                        ? 'border-green-200 text-green-600 dark:border-green-900/40 dark:text-green-400'
+                        : 'border-gray-200 dark:border-base-200 text-gray-600 dark:text-gray-400'
+                }`}
+            >
+                <Power size={16} />
+                {t('cursor_relay.auto_renew', '自动续杯')}：
+                {data?.autoRenew ? t('cursor_relay.enabled', '已开启') : t('cursor_relay.disabled', '已关闭')}
             </button>
 
             <button

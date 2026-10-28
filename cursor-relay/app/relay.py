@@ -44,8 +44,8 @@ HOST = os.environ.get("KYA_PROXY_HOST", "127.0.0.1")
 PORT = int(os.environ.get("KYA_PROXY_PORT", "8317"))
 API_KEY = os.environ.get("KYA_PROXY_KEY", "sk-kya-cursor")
 MODEL_ALIASES = [
-    "cursor-auto",
-    "cursor-auto[1m]",
+    "cursor-local",
+    "cursor-local[1m]",
     "auto",
     "auto[1m]",
     "BYOK-auto",
@@ -711,7 +711,7 @@ def anthropic_message_payload(
 def iter_anthropic_sse(payload: dict) -> Iterator[bytes]:
     """Emit Anthropic Messages SSE for a finished message (text ± tool_use)."""
     msg_id = payload["id"]
-    model = payload.get("model") or "cursor-auto"
+    model = payload.get("model") or "cursor-local"
     content = payload.get("content") or []
 
     def pack(event: str, data: dict) -> bytes:
@@ -881,7 +881,7 @@ def iter_anthropic_sse_live(
                 "id": msg_id,
                 "type": "message",
                 "role": "assistant",
-                "model": model or "cursor-auto",
+                "model": model or "cursor-local",
                 "content": [],
                 "stop_reason": None,
                 "stop_sequence": None,
@@ -1660,7 +1660,7 @@ def root():
     return {
         "service": "KeepingYouAwake LiteLLM Proxy",
         "version": "2.0",
-        "pipeline": "dialect → litellm → cursor-auto → dialect",
+        "pipeline": "dialect → litellm → cursor-local → dialect",
         "models": MODEL_ALIASES,
         "endpoints": ["/v1/models", "/v1/chat/completions", "/v1/messages", "/v1/status"],
     }
@@ -1742,7 +1742,7 @@ async def chat_completions(
     # Otherwise keep agent-behind-API for plain chat.
     if tools:
         _EXEC_MODE.set("llm")
-        echo_model = body.get("model") or "cursor-auto"
+        echo_model = body.get("model") or "cursor-local"
         print(f"[kya_llm_proxy] chat dialect={dialect} ua={user_agent!r} tools={len(tools)}", flush=True)
         try:
             prompt = messages_to_prompt(list(messages))
@@ -1783,7 +1783,7 @@ async def chat_completions(
             ) from e
 
     _EXEC_MODE.set("agent")
-    echo_model = body.get("model") or "cursor-auto"
+    echo_model = body.get("model") or "cursor-local"
     print(f"[kya_llm_proxy] chat dialect={dialect} mode=agent ua={user_agent!r}", flush=True)
     try:
         if stream:
@@ -1854,7 +1854,7 @@ async def anthropic_messages(
     _CLIENT_TOOLS.set(tools)
     # Claude Code owns tools — nested cursor-agent tools = multi-minute stalls.
     _EXEC_MODE.set("llm")
-    echo_model = body.get("model") or "cursor-auto"
+    echo_model = body.get("model") or "cursor-local"
     print(
         f"[kya_llm_proxy] messages dialect={dialect} ua={user_agent!r} tools={len(tools)}",
         flush=True,
@@ -1928,7 +1928,7 @@ async def openai_responses(
                     }
                 )
     # reuse chat completions path by building openai completion then wrapping
-    echo_model = body.get("model") or "cursor-auto"
+    echo_model = body.get("model") or "cursor-local"
     try:
         if stream:
             gen = completion(
