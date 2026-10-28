@@ -169,6 +169,21 @@ def test_history_records_each_renewal():
         assert len(pool.snapshot()["history"]) == 2
 
 
+def test_history_distinguishes_manual_and_auto():
+    with tempfile.TemporaryDirectory() as d:
+        _isolate(Path(d))
+        pool.save_pool({"active": 0, "cards": [{"email": "a@x", "cardCode": "A"}]})
+        pool._post = lambda path, code: {"success": True, "token": "Z" * 40}
+        for session in ("cursor-admin", "cursor-relay"):
+            pool._running = False
+            since = time.time() * 1000
+            pool.trigger_quota_switch(session)
+            assert pool.wait_for_quota_renewal(since, timeout_s=10), pool.read_state()
+
+        reasons = [h["reason"] for h in pool.load_history()]
+        assert reasons == ["auto", "manual"], reasons
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

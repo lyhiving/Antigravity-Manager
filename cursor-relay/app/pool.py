@@ -258,7 +258,7 @@ def renew_next_card() -> tuple[bool, str, str]:
 
 
 # ------------------------------------------------- relay-compatible surface
-def _worker() -> None:
+def _worker(reason: str = "manual") -> None:
     global _running
     try:
         ok, _token, detail = renew_next_card()
@@ -271,11 +271,12 @@ def _worker() -> None:
             "card": detail if ok else "",
             "message": "" if ok else detail,
             "deviceId": device_id(),
+            "reason": reason,
         }
     )
     write_state("success" if ok else "error", detail)
     print(
-        f"[cursor-relay] renewal {'ok' if ok else 'failed'}: {detail}",
+        f"[cursor-relay] renewal {'ok' if ok else 'failed'} ({reason}): {detail}",
         flush=True,
     )
     with _guard:
@@ -285,13 +286,21 @@ def _worker() -> None:
 def trigger_quota_switch(session_name: str = "cursor-relay") -> None:
     """Kick off a renewal in the background (mirrors the KYA signal file)."""
     global _running
+    # reason: 控制台按钮触发=manual，聊天撞到额度上限自动换号=auto
+    reason = "manual" if session_name == "cursor-admin" else "auto"
     with _guard:
         if _running:
             print("[cursor-relay] renewal already in progress, coalescing", flush=True)
             return
         _running = True
     write_state("switching", session_name)
-    threading.Thread(target=_worker, name="cursor-renewal", daemon=True).start()
+    print(
+        f"[cursor-relay] renewal start ({reason}, session={session_name})",
+        flush=True,
+    )
+    threading.Thread(
+        target=_worker, args=(reason,), name="cursor-renewal", daemon=True
+    ).start()
 
 
 def wait_for_quota_renewal(

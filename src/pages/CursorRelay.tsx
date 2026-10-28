@@ -20,6 +20,7 @@ interface RelayHistory {
     card: string;
     message: string;
     deviceId?: string;
+    reason?: 'manual' | 'auto' | string;
 }
 
 interface RelayState {
@@ -253,6 +254,13 @@ const CursorRelay: React.FC = () => {
                                 <span className={`text-sm ${h.ok ? 'text-green-600 dark:text-green-400' : 'text-red-500'}`}>
                                     {h.ok ? t('cursor_relay.history_ok', '成功') : t('cursor_relay.history_fail', '失败')}
                                     {h.card ? ` · ${h.card}` : ''}
+                                    {h.reason && (
+                                        <span className="ml-2 text-[11px] px-1.5 py-0.5 rounded bg-gray-100 text-gray-500 dark:bg-base-200 dark:text-gray-400">
+                                            {h.reason === 'manual'
+                                                ? t('cursor_relay.reason_manual', '手动')
+                                                : t('cursor_relay.reason_auto', '自动')}
+                                        </span>
+                                    )}
                                 </span>
                                 <span className="text-[11px] text-gray-400 shrink-0">{fmtTime(h.at)}</span>
                             </div>

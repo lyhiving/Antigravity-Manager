@@ -170,20 +170,23 @@ def sync_auth_from_active_token() -> None:
     token = token_path.read_text(encoding="utf-8", errors="ignore").strip()
     if len(token) < 20:
         return
-    cursor_dir = home / ".cursor"
-    cursor_dir.mkdir(parents=True, exist_ok=True)
-    auth_path = cursor_dir / "auth.json"
-    auth: dict[str, Any] = {}
-    if auth_path.is_file():
-        try:
-            auth = json.loads(auth_path.read_text(encoding="utf-8"))
-        except Exception:
-            auth = {}
-    if auth.get("accessToken") == token:
-        return
-    auth["accessToken"] = token
-    auth.setdefault("refreshToken", token)
-    auth_path.write_text(json.dumps(auth, indent=2), encoding="utf-8")
+    # cursor-agent 的 auth 位置随平台变：darwin 是 ~/.cursor，linux 读
+    # XDG_CONFIG_HOME|~/.config/cursor。两处都写，容器和 macOS 都能认证。
+    config_root = Path(os.environ.get("XDG_CONFIG_HOME") or (home / ".config"))
+    for cursor_dir in (home / ".cursor", config_root / "cursor"):
+        cursor_dir.mkdir(parents=True, exist_ok=True)
+        auth_path = cursor_dir / "auth.json"
+        auth: dict[str, Any] = {}
+        if auth_path.is_file():
+            try:
+                auth = json.loads(auth_path.read_text(encoding="utf-8"))
+            except Exception:
+                auth = {}
+        if auth.get("accessToken") == token:
+            continue
+        auth["accessToken"] = token
+        auth.setdefault("refreshToken", token)
+        auth_path.write_text(json.dumps(auth, indent=2), encoding="utf-8")
 
 
 def flatten_content(content: Any) -> str:
