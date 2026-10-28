@@ -46,6 +46,11 @@ DEFAULT_DEVICE_ID = "D6CDA11D-E07A-5B09-BE57-B3AD55284470"
 HOSTS = ("https://www.skhxd.top", "https://www.xxdlzs.cn")
 R1_PATH = "/hou/dwd/m3qr/r1"
 RS1_PATH = "/hou/dwd/m3qr/rs1"
+# 与 KYA 保持一致：缺 UA 会被站点 WAF 直接 403
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36"
+)
 
 WAIT_TIMEOUT_S = float(os.environ.get("CURSOR_RENEW_WAIT_S", "120"))
 HTTP_TIMEOUT_S = float(os.environ.get("CURSOR_RENEW_HTTP_S", "20"))
@@ -175,7 +180,10 @@ def _post(path: str, card_code: str) -> dict:
                 host + path,
                 data=body,
                 method="POST",
-                headers={"Content-Type": "application/json"},
+                headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": USER_AGENT,
+                },
             )
             with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S) as resp:
                 payload = resp.read().decode("utf-8", "ignore").strip() or "{}"
