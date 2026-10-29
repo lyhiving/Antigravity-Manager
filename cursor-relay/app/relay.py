@@ -40,6 +40,8 @@ from litellm.types.utils import GenericStreamingChunk
 from litellm.utils import custom_llm_setup
 import uvicorn
 
+import logdb
+
 HOST = os.environ.get("KYA_PROXY_HOST", "127.0.0.1")
 PORT = int(os.environ.get("KYA_PROXY_PORT", "8317"))
 API_KEY = os.environ.get("KYA_PROXY_KEY", "sk-kya-cursor")
@@ -2047,9 +2049,73 @@ async def options_cors(full_path: str):
     )
 
 
+_LOG_PATHS = frozenset({
+    "/v1/chat/completions", "/chat/completions",
+    "/v1/completions", "/completions",
+    "/v1/messages", "/messages",
+    "/v1/responses", "/responses",
+})
+
+
+async def _logged_stream(body_iterator, status, write):
+    """流式响应包一层：流结束才落库，duration 与 Rust monitor 中间件一致算全程。"""
+    # ponytail: BaseHTTPMiddleware 把路由内异常推迟到 body 发完后才抛出，这一层看不到，
+    # 中途断流会记成 200/error=None；要精确捕获需改成纯 ASGI 中间件（uvicorn 侧仍有堆栈）。
+    error = None
+    try:
+        async for chunk in body_iterator:
+            yield chunk
+    except Exception as e:
+        error = f"{type(e).__name__}: {e}"
+        raise
+    finally:
+        write(status, error)
+
+
 @app.middleware("http")
 async def add_cors(request: Request, call_next):
-    response = await call_next(request)
+    path = request.url.path
+    # 按后缀匹配，容忍反代没 strip 掉的 /cursor 之类前缀
+    loggable = request.method == "POST" and any(
+        path.rstrip("/").endswith(p) for p in _LOG_PATHS
+    )
+    model = None
+    if loggable:
+        try:
+            payload = json.loads(await request.body())
+            if isinstance(payload, dict):
+                model = payload.get("model")
+        except Exception:
+            pass
+    started = time.monotonic()
+
+    def write(status: int, error: str | None) -> None:
+        logdb.record(
+            method=request.method,
+            url=path,
+            status=status,
+            duration_ms=int((time.monotonic() - started) * 1000),
+            model=model if isinstance(model, str) else None,
+            protocol="anthropic" if "messages" in path else "openai",
+            client_ip=request.client.host if request.client else None,
+            error=error,
+        )
+
+    try:
+        response = await call_next(request)
+    except Exception as e:
+        if loggable:
+            write(500, f"{type(e).__name__}: {e}")
+        raise
+
+    if loggable:
+        if hasattr(response, "body_iterator"):
+            response.body_iterator = _logged_stream(
+                response.body_iterator, response.status_code, write
+            )
+        else:
+            write(response.status_code, None)
+
     response.headers["Access-Control-Allow-Origin"] = "*"
     return response
 
