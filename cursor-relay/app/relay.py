@@ -27,6 +27,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -78,6 +79,12 @@ _CLIENT_DIALECT: contextvars.ContextVar[str] = contextvars.ContextVar(
 # Tools advertised by the client request (Anthropic or OpenAI shape).
 _CLIENT_TOOLS: contextvars.ContextVar[List[dict]] = contextvars.ContextVar(
     "kya_client_tools", default=[]
+)
+# 请求级元数据槽：中间件建空 dict，cursor-agent 的 result 事件往里填 usage。
+# BaseHTTPMiddleware 复制 context 但共享同一个对象，所以路由里的写能被子 task 外的
+# write() 读到（在路由里 set 新值则读不到，只能改对象内容）。
+_REQ_META: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "kya_req_meta", default=None
 )
 
 ClientDialect = str  # claude | cursor | codex | deepseek | openai
@@ -338,6 +345,9 @@ def messages_to_prompt(messages: list) -> str:
 
 
 _FENCE_RE = re.compile(r"```(?:[\w-]+)?\n(.*?)```", re.DOTALL)
+# tool_calls 被摘走后只剩空白的围栏，客户端会渲染成一个空 JSON 代码块。
+# 尾部的孤立开头围栏（模型在 ```json 处被截断）同样要清掉。
+_EMPTY_FENCE_RE = re.compile(r"```[\w-]*[ \t]*\n?\s*(?:```|\Z)")
 # Anthropic-native tool XML (Claude). Allow odd whitespace from bad joins.
 _ANTHROPIC_INVOKE_RE = re.compile(
     r'<\s*invoke\s+name\s*=\s*["\']([^"\']+)["\']\s*>(.*?)<\s*/\s*invoke\s*>',
@@ -627,6 +637,7 @@ def extract_tool_calls_for_dialect(
                 calls.append(parsed)
                 remaining = remaining.replace(m.group(0), "\n")
 
+    remaining = _EMPTY_FENCE_RE.sub("\n", remaining)
     prose = _dedupe_repeated_prose(re.sub(r"\n{3,}", "\n\n", remaining).strip())
     return prose, _dedupe_calls(calls)
 
@@ -1199,18 +1210,31 @@ def _agent_popen(prompt: str, *, stream_json: bool) -> subprocess.Popen:
         args += ["--output-format", "stream-json", "--stream-partial-output"]
     else:
         args += ["--output-format", "text"]
-    args.append(prompt)
     env = os.environ.copy()
     env.pop("CURSOR_API_KEY", None)
     cwd = workspace if workspace and Path(workspace).is_dir() else str(Path.home())
-    return subprocess.Popen(
+    # prompt 走 stdin 而不是 argv：40k+ token 的 prompt 超过 MAX_ARG_STRLEN(128KB)
+    # 会直接 [Errno 7] Argument list too long。无位置参数时 cursor-agent 从 stdin 读。
+    proc = subprocess.Popen(
         args,
+        stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         env=env,
         cwd=cwd,
     )
+
+    def _feed_stdin() -> None:
+        # pipe 缓冲只有 64KB，大 prompt 同步写完会死锁；丢给守护线程，进程提前退出就忽略
+        try:
+            proc.stdin.write(prompt)  # type: ignore[union-attr]
+            proc.stdin.close()  # type: ignore[union-attr]
+        except Exception:
+            pass
+
+    threading.Thread(target=_feed_stdin, daemon=True).start()
+    return proc
 
 
 def _diag_from_stream_obj(obj: dict) -> str:
@@ -1231,6 +1255,32 @@ def _diag_from_stream_obj(obj: dict) -> str:
 _STREAM_MSG_BOUNDARY = frozenset(
     {"tool_call", "tool_result", "user", "result", "error"}
 )
+
+# cursor-agent result.usage（camelCase）→ request_logs 列名
+_USAGE_FIELDS = (
+    ("input_tokens", "inputTokens"),
+    ("output_tokens", "outputTokens"),
+    ("cached_tokens", "cacheReadTokens"),
+)
+
+
+def _record_usage(obj: dict) -> None:
+    """把 result 事件的 usage 累加进本次请求的元数据槽，供日志中间件落库。
+
+    额度重试会多次调用 agent，每次都是真实消耗，所以累加而不是覆盖。
+    """
+    meta = _REQ_META.get()
+    if meta is None:
+        return
+    usage = obj.get("usage")
+    if isinstance(usage, dict):
+        for col, src in _USAGE_FIELDS:
+            val = usage.get(src)
+            if isinstance(val, int):
+                meta[col] = meta.get(col, 0) + val
+    sid = obj.get("session_id")
+    if isinstance(sid, str) and sid:
+        meta["session_id"] = sid
 
 
 def _repair_exploded_text(text: str) -> str:
@@ -1440,6 +1490,8 @@ def _iter_agent_stream_once(prompt: str, attempt: _StreamAttempt) -> Iterator[st
             snap = flatten_content((obj.get("message") or {}).get("content"))
             yield from emit_snapshot(snap)
             return
+        if typ == "result":
+            _record_usage(obj)
         if typ in _STREAM_MSG_BOUNDARY:
             boundary = True
         d = _diag_from_stream_obj(obj)
@@ -2057,19 +2109,30 @@ _LOG_PATHS = frozenset({
 })
 
 
-async def _logged_stream(body_iterator, status, write):
+_CONTENT_RE = re.compile(rb'"content"\s*:\s*"[^"]')
+
+
+def _has_content(chunk: bytes) -> bool:
+    """该 chunk 是否已吐出正文：Anthropic 用 content_block_delta，OpenAI 用非空 content。"""
+    return b"content_block_delta" in chunk or _CONTENT_RE.search(chunk) is not None
+
+
+async def _logged_stream(body_iterator, status, write, started):
     """流式响应包一层：流结束才落库，duration 与 Rust monitor 中间件一致算全程。"""
     # ponytail: BaseHTTPMiddleware 把路由内异常推迟到 body 发完后才抛出，这一层看不到，
     # 中途断流会记成 200/error=None；要精确捕获需改成纯 ASGI 中间件（uvicorn 侧仍有堆栈）。
     error = None
+    ttft_ms = None
     try:
         async for chunk in body_iterator:
+            if ttft_ms is None and _has_content(chunk):
+                ttft_ms = int((time.monotonic() - started) * 1000)
             yield chunk
     except Exception as e:
         error = f"{type(e).__name__}: {e}"
         raise
     finally:
-        write(status, error)
+        write(status, error, ttft_ms)
 
 
 @app.middleware("http")
@@ -2088,17 +2151,28 @@ async def add_cors(request: Request, call_next):
         except Exception:
             pass
     started = time.monotonic()
+    # agent 侧只改这个 dict 的内容（不 set 新值），跨 BaseHTTPMiddleware 的 task 边界可见。
+    # 每个请求是独立 task + context，请求结束即销毁，不需要 reset。
+    meta: dict = {}
+    _REQ_META.set(meta)
 
-    def write(status: int, error: str | None) -> None:
+    def write(status: int, error: str | None, ttft_ms: int | None = None) -> None:
+        duration_ms = int((time.monotonic() - started) * 1000)
         logdb.record(
             method=request.method,
             url=path,
             status=status,
-            duration_ms=int((time.monotonic() - started) * 1000),
+            duration_ms=duration_ms,
+            # 非流式没有「首字」概念，整段就是首字
+            ttft_ms=duration_ms if ttft_ms is None else min(ttft_ms, duration_ms),
             model=model if isinstance(model, str) else None,
             protocol="anthropic" if "messages" in path else "openai",
             client_ip=request.client.host if request.client else None,
             error=error,
+            session_id=meta.get("session_id"),
+            input_tokens=meta.get("input_tokens"),
+            output_tokens=meta.get("output_tokens"),
+            cached_tokens=meta.get("cached_tokens"),
         )
 
     try:
@@ -2111,7 +2185,7 @@ async def add_cors(request: Request, call_next):
     if loggable:
         if hasattr(response, "body_iterator"):
             response.body_iterator = _logged_stream(
-                response.body_iterator, response.status_code, write
+                response.body_iterator, response.status_code, write, started
             )
         else:
             write(response.status_code, None)

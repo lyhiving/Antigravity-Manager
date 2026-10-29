@@ -8,6 +8,7 @@ the proxy path never pays for logging.
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import time
@@ -22,18 +23,28 @@ DB_PATH = Path(
 _COLUMNS = (
     "id", "timestamp", "method", "url", "status", "duration",
     "model", "mapped_model", "upstream_model", "account_email",
-    "protocol", "username", "client_ip", "error", "session_id",
+    "protocol", "username", "client_ip", "error", "response_headers",
+    "session_id", "input_tokens", "output_tokens", "cached_tokens",
 )
 
 
+def _mask_account(account: str) -> str:
+    """入库即脱敏：邮箱留前 3 位 + 域名（与 Monitor 前端规则一致），卡密只留前 3 位。"""
+    if "@" in account:
+        local, _, domain = account.partition("@")
+        return f"{local[:3]}***@{domain}"
+    return f"{account[:3]}***"
+
+
 def _active_email() -> str | None:
-    """当前卡池里支撑这条请求的卡密邮箱（pool.py 的 active 卡）。"""
+    """当前卡池里支撑这条请求的账号（pool.py 的 active 卡），脱敏后返回。"""
     try:
         import pool
 
         data = pool.load_pool()
         card = data["cards"][int(data.get("active") or 0)]
-        return card.get("email") or None
+        raw = str(card.get("email") or "").strip()
+        return _mask_account(raw) if raw else None
     except Exception:
         return None
 
@@ -48,6 +59,11 @@ def record(
     protocol: str | None = None,
     client_ip: str | None = None,
     error: str | None = None,
+    ttft_ms: int | None = None,
+    session_id: str | None = None,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+    cached_tokens: int | None = None,
 ) -> None:
     if not DB_PATH.exists():
         return
@@ -66,7 +82,12 @@ def record(
         "cursor-relay",
         client_ip,
         error[:1024] if error else None,
-        None,
+        # Monitor 页的「首字」从 response_headers 里读 x-timing-ttft-ms（同 Rust 侧约定）
+        json.dumps({"x-timing-ttft-ms": str(ttft_ms)}) if ttft_ms is not None else None,
+        session_id,
+        input_tokens,
+        output_tokens,
+        cached_tokens,
     )
     try:
         conn = sqlite3.connect(DB_PATH, timeout=2.5)
@@ -93,7 +114,9 @@ if __name__ == "__main__":
             "CREATE TABLE request_logs (id TEXT PRIMARY KEY, timestamp INTEGER, "
             "method TEXT, url TEXT, status INTEGER, duration INTEGER, model TEXT, "
             "mapped_model TEXT, upstream_model TEXT, account_email TEXT, protocol TEXT, "
-            "username TEXT, client_ip TEXT, error TEXT, session_id TEXT)"
+            "username TEXT, client_ip TEXT, error TEXT, response_headers TEXT, "
+            "session_id TEXT, input_tokens INTEGER, output_tokens INTEGER, "
+            "cached_tokens INTEGER)"
         )
         conn.commit()
         conn.close()
@@ -107,6 +130,11 @@ if __name__ == "__main__":
             model="cursor-local",
             protocol="anthropic",
             client_ip="127.0.0.1",
+            ttft_ms=456,
+            session_id="sess-1",
+            input_tokens=99,
+            output_tokens=40,
+            cached_tokens=9344,
         )
         record(method="POST", url="/v1/messages", status=502,
                duration_ms=7, error="X" * 4000)
@@ -114,13 +142,24 @@ if __name__ == "__main__":
         conn = sqlite3.connect(DB_PATH)
         rows = conn.execute(
             "SELECT timestamp, status, duration, model, protocol, username, "
-            "client_ip, length(error) FROM request_logs ORDER BY timestamp"
+            "client_ip, length(error), response_headers, session_id, "
+            "input_tokens, output_tokens, cached_tokens "
+            "FROM request_logs ORDER BY timestamp"
         ).fetchall()
         conn.close()
 
-        ts, status, dur, model, proto, user, ip, errlen = rows[0]
+        ts, status, dur, model, proto, user, ip, errlen, rh = rows[0][:9]
         assert ts >= before and status == 200 and dur == 1234, rows[0]
         assert model == "cursor-local" and proto == "anthropic" and user == "cursor-relay"
         assert ip == "127.0.0.1" and errlen is None, rows[0]
+        assert json.loads(rh)["x-timing-ttft-ms"] == "456", rh
+        assert rows[0][9:] == ("sess-1", 99, 40, 9344), rows[0]
         assert rows[1][1] == 502 and rows[1][7] == 1024, "error 截断 1024"
+        assert rows[1][8] is None, "无首字时 response_headers 留空"
+        assert rows[1][10:] == (None, None, None), "无 usage 时留空"
+
+        # 账号脱敏：邮箱形态与前端同规则，卡密只留前 3 位
+        assert _mask_account("hermes.chen@gmail.com") == "her***@gmail.com"
+        assert _mask_account("GGLY8T8OPN") == "GGL***"
+        assert _mask_account("") == "***"
         print("ok  logdb self-check")
