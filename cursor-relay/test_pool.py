@@ -334,6 +334,19 @@ def test_history_distinguishes_manual_and_auto():
         assert reasons == ["auto", "manual"], reasons
 
 
+def test_snapshot_history_caps_at_five():
+    """控制台快照只回最近 5 条；完整列表走 /admin/history，避免轮询渲染变慢。"""
+    with tempfile.TemporaryDirectory() as d:
+        _isolate(Path(d))
+        for i in range(8):
+            pool.add_history({"at": i, "ok": True, "card": f"c{i}", "message": "", "reason": "manual"})
+
+        history = pool.snapshot()["history"]
+        assert pool.SNAPSHOT_HISTORY == 5, pool.SNAPSHOT_HISTORY
+        assert [h["at"] for h in history] == [7, 6, 5, 4, 3], history
+        assert len(pool.load_history()) == 8, "文件仍保留全部记录"
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

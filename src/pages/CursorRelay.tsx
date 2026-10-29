@@ -34,7 +34,10 @@ interface RelayState {
 }
 
 // 生产环境由 nginx 把 /cursor/ 反代到 relay(8317)；本地开发可用 VITE_CURSOR_RELAY_BASE 覆盖
-const API_BASE = `${import.meta.env.VITE_CURSOR_RELAY_BASE || '/cursor'}/admin/api`;
+const RELAY_BASE = import.meta.env.VITE_CURSOR_RELAY_BASE || '/cursor';
+const API_BASE = `${RELAY_BASE}/admin/api`;
+// 完整续杯记录在独立页面，避免控制台轮询时全量渲染
+const HISTORY_PAGE = `${RELAY_BASE}/admin/history`;
 
 async function relayApi<T>(path: string, body?: unknown): Promise<T> {
     const key = sessionStorage.getItem('abv_admin_api_key') || '';
@@ -269,8 +272,18 @@ const CursorRelay: React.FC = () => {
             </div>
 
             <div className="mt-4">
-                <div className="font-semibold text-sm text-gray-700 dark:text-gray-300 mb-2">
-                    {t('cursor_relay.history', '续杯记录')} <span className="text-gray-400 font-normal">({history.length})</span>
+                <div className="flex items-center justify-between gap-2 mb-2">
+                    <div className="font-semibold text-sm text-gray-700 dark:text-gray-300">
+                        {t('cursor_relay.history', '续杯记录')} <span className="text-gray-400 font-normal">({history.length})</span>
+                    </div>
+                    <a
+                        href={HISTORY_PAGE}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-xs text-blue-600 dark:text-blue-400 min-h-9 inline-flex items-center"
+                    >
+                        {t('cursor_relay.view_all_history', '查看全部')}
+                    </a>
                 </div>
                 <div className="bg-white dark:bg-base-100 rounded-xl shadow-sm border border-gray-100 dark:border-base-200 divide-y divide-gray-100 dark:divide-base-200">
                     {history.length === 0 && (

@@ -34,7 +34,8 @@ DATA_ROOT = Path(
 CARDS_FILE = DATA_ROOT / "cards.json"
 HISTORY_FILE = DATA_ROOT / "renewal_history.json"
 HISTORY_LIMIT = 200
-SNAPSHOT_HISTORY = 20
+# 控制台每 5s 轮询 /state，完整列表走独立的 /admin/history 页，这里只回最近几条
+SNAPSHOT_HISTORY = 5
 
 TK_DIR = Path.home() / ".cursor-tk"
 ACTIVE_TOKEN = TK_DIR / "active_token"

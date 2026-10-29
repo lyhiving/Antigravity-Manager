@@ -22,6 +22,7 @@ relay.wait_for_quota_renewal = pool.wait_for_quota_renewal
 app = relay.app
 ADMIN_PASSWORD = os.environ.get("CURSOR_ADMIN_PASSWORD", "")
 ADMIN_HTML = (Path(__file__).with_name("admin.html")).read_text(encoding="utf-8")
+HISTORY_HTML = (Path(__file__).with_name("history.html")).read_text(encoding="utf-8")
 
 
 def _unauthorized() -> HTTPException:
@@ -62,9 +63,26 @@ async def admin_page() -> str:
     return ADMIN_HTML
 
 
+@app.get("/admin/history", response_class=HTMLResponse, dependencies=[Depends(admin_auth)])
+async def history_page() -> str:
+    return HISTORY_HTML
+
+
 @app.get("/admin/api/state", dependencies=[Depends(admin_auth)])
 async def admin_state() -> dict:
     return pool.snapshot()
+
+
+@app.get("/admin/api/history", dependencies=[Depends(admin_auth)])
+async def admin_history(limit: int = 50, offset: int = 0) -> dict:
+    items = pool.load_history()
+    offset = max(0, offset)
+    limit = min(max(1, limit), pool.HISTORY_LIMIT)
+    return {
+        "total": len(items),
+        "offset": offset,
+        "items": items[offset:offset + limit],
+    }
 
 
 @app.post("/admin/api/cards", dependencies=[Depends(admin_auth)])
