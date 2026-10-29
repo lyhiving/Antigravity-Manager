@@ -1746,6 +1746,75 @@ async def chat_completions(
         print(f"[kya_llm_proxy] chat dialect={dialect} ua={user_agent!r} tools={len(tools)}", flush=True)
         try:
             prompt = messages_to_prompt(list(messages))
+            if stream:
+                def oai_live_sse():
+                    cid = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+                    created = int(time.time())
+                    acc: List[str] = []
+                    hold = ""
+                    first = True
+
+                    def emit(delta: dict, finish_reason=None) -> str:
+                        return "data: " + json.dumps(
+                            {
+                                "id": cid,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": echo_model,
+                                "choices": [
+                                    {"index": 0, "delta": delta, "finish_reason": finish_reason}
+                                ],
+                            },
+                            ensure_ascii=False,
+                        ) + "\n\n"
+
+                    def text_delta(text: str) -> str:
+                        nonlocal first
+                        d: Dict[str, Any] = {"content": text}
+                        if first:
+                            d["role"] = "assistant"
+                            first = False
+                        return emit(d)
+
+                    try:
+                        for piece in run_cursor_agent_stream(prompt):
+                            acc.append(piece)
+                            hold += piece
+                            safe, hold = _split_stream_hold(hold)
+                            if safe:
+                                yield text_delta(safe)
+                        tail, _markup = _flush_stream_hold(hold)
+                        if tail:
+                            yield text_delta(tail)
+                    except Exception as e:  # headers already sent; surface as truncated text
+                        print(f"[kya_llm_proxy] {dialect}: live stream error: {e}", flush=True)
+
+                    _prose, live_calls = extract_tool_calls_for_dialect(
+                        "".join(acc), tools, dialect
+                    )
+                    if live_calls:
+                        oc = openai_chat_payload(
+                            model=echo_model, prose="", tool_calls=live_calls
+                        )["choices"][0]
+                        yield emit(
+                            {
+                                "tool_calls": [
+                                    {"index": i, **c}
+                                    for i, c in enumerate(oc["message"]["tool_calls"])
+                                ]
+                            },
+                            oc["finish_reason"],
+                        )
+                        print(
+                            f"[kya_llm_proxy] {dialect}: mapped {len(live_calls)} live tool_calls",
+                            flush=True,
+                        )
+                    else:
+                        yield emit({}, "stop")
+                    yield "data: [DONE]\n\n"
+
+                return StreamingResponse(oai_live_sse(), media_type="text/event-stream")
+
             raw_text = run_cursor_agent_with_quota_retry(prompt)
             prose, tool_calls = extract_tool_calls_for_dialect(raw_text, tools, dialect)
             if tool_calls:
@@ -1756,26 +1825,6 @@ async def chat_completions(
             payload = openai_chat_payload(
                 model=echo_model, prose=prose, tool_calls=tool_calls
             )
-            if stream:
-                # Minimal SSE: one assistant delta then finish
-                def oai_sse():
-                    chunk = {
-                        "id": payload["id"],
-                        "object": "chat.completion.chunk",
-                        "created": payload["created"],
-                        "model": echo_model,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": payload["choices"][0]["message"],
-                                "finish_reason": payload["choices"][0]["finish_reason"],
-                            }
-                        ],
-                    }
-                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                    yield "data: [DONE]\n\n"
-
-                return StreamingResponse(oai_sse(), media_type="text/event-stream")
             return JSONResponse(payload)
         except Exception as e:
             raise HTTPException(
