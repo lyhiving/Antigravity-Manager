@@ -19,13 +19,33 @@ DB_PATH = Path(
     os.environ.get("ABV_DATA_DIR") or (Path.home() / ".antigravity_tools")
 ) / "proxy_logs.db"
 
-# 列名与 Rust 侧 save_log 的 INSERT 一致；body 类字段留空，避免重复占盘
+# 列名与 Rust 侧 save_log 的 INSERT 一致
 _COLUMNS = (
     "id", "timestamp", "method", "url", "status", "duration",
     "model", "mapped_model", "upstream_model", "account_email",
     "protocol", "username", "client_ip", "error", "response_headers",
     "session_id", "input_tokens", "output_tokens", "cached_tokens",
+    "request_body", "upstream_request_body", "response_body",
 )
+
+# Monitor 明细页一次性渲染整段报文，超长会把页面拖死，入库存截断版
+BODY_LIMIT = 256 * 1024
+
+
+def _cap(text: str | None) -> str | None:
+    if not text:
+        return None
+    if len(text) <= BODY_LIMIT:
+        return text
+    return f"{text[:BODY_LIMIT]}\n…[truncated {len(text) - BODY_LIMIT} chars]"
+
+
+def _pretty(text: str | None) -> str | None:
+    """能整段解析成 JSON 就缩进展开，跟 Rust 侧响应报文观感一致。"""
+    try:
+        return json.dumps(json.loads(text), ensure_ascii=False, indent=2)
+    except Exception:
+        return text
 
 
 def _mask_account(account: str) -> str:
@@ -64,6 +84,9 @@ def record(
     input_tokens: int | None = None,
     output_tokens: int | None = None,
     cached_tokens: int | None = None,
+    request_body: str | None = None,
+    upstream_request_body: str | None = None,
+    response_body: str | None = None,
 ) -> None:
     if not DB_PATH.exists():
         return
@@ -88,6 +111,9 @@ def record(
         input_tokens,
         output_tokens,
         cached_tokens,
+        _cap(_pretty(request_body)),
+        _cap(upstream_request_body),
+        _cap(response_body),
     )
     try:
         conn = sqlite3.connect(DB_PATH, timeout=2.5)
@@ -116,7 +142,8 @@ if __name__ == "__main__":
             "mapped_model TEXT, upstream_model TEXT, account_email TEXT, protocol TEXT, "
             "username TEXT, client_ip TEXT, error TEXT, response_headers TEXT, "
             "session_id TEXT, input_tokens INTEGER, output_tokens INTEGER, "
-            "cached_tokens INTEGER)"
+            "cached_tokens INTEGER, request_body TEXT, upstream_request_body TEXT, "
+            "response_body TEXT)"
         )
         conn.commit()
         conn.close()
@@ -135,6 +162,9 @@ if __name__ == "__main__":
             input_tokens=99,
             output_tokens=40,
             cached_tokens=9344,
+            request_body='{"model":"cursor-local","messages":[]}',
+            upstream_request_body="P" * (BODY_LIMIT + 50),
+            response_body='data: {"delta":{"text":"hi"}}\n\n',
         )
         record(method="POST", url="/v1/messages", status=502,
                duration_ms=7, error="X" * 4000)
@@ -143,7 +173,8 @@ if __name__ == "__main__":
         rows = conn.execute(
             "SELECT timestamp, status, duration, model, protocol, username, "
             "client_ip, length(error), response_headers, session_id, "
-            "input_tokens, output_tokens, cached_tokens "
+            "input_tokens, output_tokens, cached_tokens, request_body, "
+            "upstream_request_body, response_body "
             "FROM request_logs ORDER BY timestamp"
         ).fetchall()
         conn.close()
@@ -153,10 +184,15 @@ if __name__ == "__main__":
         assert model == "cursor-local" and proto == "anthropic" and user == "cursor-relay"
         assert ip == "127.0.0.1" and errlen is None, rows[0]
         assert json.loads(rh)["x-timing-ttft-ms"] == "456", rh
-        assert rows[0][9:] == ("sess-1", 99, 40, 9344), rows[0]
+        assert rows[0][9:13] == ("sess-1", 99, 40, 9344), rows[0]
         assert rows[1][1] == 502 and rows[1][7] == 1024, "error 截断 1024"
         assert rows[1][8] is None, "无首字时 response_headers 留空"
-        assert rows[1][10:] == (None, None, None), "无 usage 时留空"
+        assert rows[1][10:] == (None, None, None, None, None, None), "无 usage 时留空"
+
+        # 报文：请求体缩进展开，超长转出报文截断，流式响应保留原文
+        assert rows[0][13] == '{\n  "model": "cursor-local",\n  "messages": []\n}', rows[0][13]
+        assert rows[0][14].startswith("P" * 100) and "[truncated 50 chars]" in rows[0][14]
+        assert rows[0][15].startswith("data: "), rows[0][15]
 
         # 账号脱敏：邮箱形态与前端同规则，卡密只留前 3 位
         assert _mask_account("hermes.chen@gmail.com") == "her***@gmail.com"

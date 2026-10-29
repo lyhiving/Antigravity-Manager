@@ -1191,6 +1191,10 @@ def wait_for_quota_renewal(since_ms: float, timeout_s: float = QUOTA_WAIT_TIMEOU
 def _agent_popen(prompt: str, *, stream_json: bool) -> subprocess.Popen:
     if not prompt.strip():
         raise RuntimeError("empty prompt")
+    # Monitor 明细页的「转出报文」：cursor-agent 的实际输入就是这段 prompt
+    meta = _REQ_META.get()
+    if meta is not None:
+        meta.setdefault("upstream_body", prompt)
     sync_auth_from_active_token()
     agent = resolve_cursor_agent()
     mode = current_exec_mode()
@@ -2123,16 +2127,22 @@ async def _logged_stream(body_iterator, status, write, started):
     # 中途断流会记成 200/error=None；要精确捕获需改成纯 ASGI 中间件（uvicorn 侧仍有堆栈）。
     error = None
     ttft_ms = None
+    captured: list[str] = []
+    captured_len = 0
     try:
         async for chunk in body_iterator:
             if ttft_ms is None and _has_content(chunk):
                 ttft_ms = int((time.monotonic() - started) * 1000)
+            if captured_len < logdb.BODY_LIMIT:
+                piece = chunk.decode("utf-8", "replace") if isinstance(chunk, bytes) else str(chunk)
+                captured.append(piece)
+                captured_len += len(piece)
             yield chunk
     except Exception as e:
         error = f"{type(e).__name__}: {e}"
         raise
     finally:
-        write(status, error, ttft_ms)
+        write(status, error, ttft_ms, "".join(captured))
 
 
 @app.middleware("http")
@@ -2143,9 +2153,12 @@ async def add_cors(request: Request, call_next):
         path.rstrip("/").endswith(p) for p in _LOG_PATHS
     )
     model = None
+    request_text = None
     if loggable:
         try:
-            payload = json.loads(await request.body())
+            raw_body = await request.body()
+            request_text = raw_body.decode("utf-8", "replace")
+            payload = json.loads(raw_body)
             if isinstance(payload, dict):
                 model = payload.get("model")
         except Exception:
@@ -2156,7 +2169,12 @@ async def add_cors(request: Request, call_next):
     meta: dict = {}
     _REQ_META.set(meta)
 
-    def write(status: int, error: str | None, ttft_ms: int | None = None) -> None:
+    def write(
+        status: int,
+        error: str | None,
+        ttft_ms: int | None = None,
+        response_body: str | None = None,
+    ) -> None:
         duration_ms = int((time.monotonic() - started) * 1000)
         logdb.record(
             method=request.method,
@@ -2173,6 +2191,9 @@ async def add_cors(request: Request, call_next):
             input_tokens=meta.get("input_tokens"),
             output_tokens=meta.get("output_tokens"),
             cached_tokens=meta.get("cached_tokens"),
+            request_body=request_text,
+            upstream_request_body=meta.get("upstream_body"),
+            response_body=response_body,
         )
 
     try:
@@ -2188,7 +2209,13 @@ async def add_cors(request: Request, call_next):
                 response.body_iterator, response.status_code, write, started
             )
         else:
-            write(response.status_code, None)
+            raw = getattr(response, "body", None)
+            write(
+                response.status_code,
+                None,
+                None,
+                raw.decode("utf-8", "replace") if isinstance(raw, bytes) else None,
+            )
 
     response.headers["Access-Control-Allow-Origin"] = "*"
     return response
