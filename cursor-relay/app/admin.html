@@ -96,6 +96,7 @@ function render(d){
         <span class="badge">${esc(c.cardType)}</span>
       </div>
       <div class="k" style="margin-top:4px">${esc(c.cardCode)} · 续杯 ${c.renewCount} 次${c.lastRenewAt ? ' · ' + ago(c.lastRenewAt) : ''}</div>
+      <div class="k">重置 ${c.resetCount}/10 次 · 今日 ${c.resetDayCount}/1${c.expired ? ' · <span class="err">已过期</span>' : ''}${c.resetCapped ? ' · ' + esc(c.resetCapped) : ''}</div>
       <div class="actions">
         <button class="ghost" data-use="${c.index}" ${c.active ? 'disabled' : ''}>设为当前</button>
         <button class="danger" data-del="${c.index}">删除</button>

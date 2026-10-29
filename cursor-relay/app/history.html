@@ -61,7 +61,7 @@ function render(items){
     <div class="item">
       <div class="head">
         <span class="${h.ok ? 'ok' : 'err'}">
-          ${h.ok ? '成功' : '失败'}${h.card ? ' · ' + esc(h.card) : ''}
+          ${h.ok ? (h.action === 'reset' ? '重置额度' : '续杯') : '失败'}${h.card ? ' · ' + esc(h.card) : ''}
           ${h.reason ? `<span class="badge">${h.reason === 'manual' ? '手动' : '自动'}</span>` : ''}
         </span>
         <span class="time">${esc(fmtTime(h.at))}</span>

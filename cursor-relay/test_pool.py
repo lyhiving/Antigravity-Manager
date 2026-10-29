@@ -123,8 +123,9 @@ def test_pool_rotates_past_dead_key():
             return {"success": False, "message": "无效卡密"}
 
         pool._post = fake
-        ok, token, detail = pool.renew_next_card()
+        ok, token, action, index, detail = pool.renew_next_card()
         assert ok and token == "L" * 40 and detail == "live@x", (ok, token, detail)
+        assert action == "renew" and index == 1, (action, index)
         assert pool.load_pool()["active"] == 1
         assert pool.read_active_token() == "L" * 40
         assert pool.load_daily()["switches"] == 0, "轮换备用卡后今日换号计数应清零"
@@ -147,8 +148,9 @@ def test_pool_does_not_wrap_to_earlier_cards():
             return {"success": False, "message": "无效卡密"}
 
         pool._post = fake
-        ok, _token, _detail = pool.renew_next_card()
-        assert not ok and seen and set(seen) == {"DEAD"}, seen
+        ok, _token, action, _idx, _detail = pool.renew_next_card()
+        assert not ok and action == "failed", (ok, action)
+        assert seen and set(seen) == {"DEAD"}, seen
         assert pool.load_pool()["active"] == 1
 
 
@@ -160,8 +162,8 @@ def test_pool_reports_only_after_all_keys_fail():
             "cards": [{"email": "a@x", "cardCode": "A"}, {"email": "b@x", "cardCode": "B"}],
         })
         pool._post = lambda path, code: {"success": False, "message": "无效卡密"}
-        ok, token, detail = pool.renew_next_card()
-        assert not ok and token == ""
+        ok, token, action, _idx, detail = pool.renew_next_card()
+        assert not ok and token == "" and action == "failed", (ok, token, action)
         assert "a@x" in detail and "b@x" in detail, detail
         assert pool.read_active_token() == ""
 
@@ -189,7 +191,7 @@ def test_wait_times_out_when_renewal_fails():
         pool.trigger_quota_switch("test")
         assert pool.wait_for_quota_renewal(since, timeout_s=10) is False
         state = pool.read_state()
-        assert state["status"] == "error" and state["phase"] == "failed", state
+        assert state["status"] == "error" and state["phase"] == "pool-exhausted", state
 
 
 def test_manual_switch_skipped_during_cooldown():
@@ -345,6 +347,103 @@ def test_snapshot_history_caps_at_five():
         assert pool.SNAPSHOT_HISTORY == 5, pool.SNAPSHOT_HISTORY
         assert [h["at"] for h in history] == [7, 6, 5, 4, 3], history
         assert len(pool.load_history()) == 8, "文件仍保留全部记录"
+
+
+def test_expired_card_skipped_without_cloud_call():
+    """endTime 已过的卡本地直接跳过，一次云端请求都不打。"""
+    with tempfile.TemporaryDirectory() as d:
+        _isolate(Path(d))
+        pool.save_pool({
+            "active": 0,
+            "cards": [
+                {"email": "old@x", "cardCode": "OLD", "endTime": "2020-01-01"},
+                {"email": "live@x", "cardCode": "LIVE"},
+            ],
+        })
+        seen = []
+
+        def fake(path, code):
+            seen.append(code)
+            return {"success": True, "token": "L" * 40}
+
+        pool._post = fake
+        ok, token, action, idx, detail = pool.renew_next_card()
+        assert ok and token == "L" * 40 and detail == "live@x", (ok, token, detail)
+        assert seen == ["LIVE"], seen
+        assert action == "renew" and idx == 1
+        assert pool.snapshot()["cards"][0]["expired"] is True
+
+
+def test_reset_quota_capped_per_card():
+    """每卡每日 1 次、累计 10 次：超了本地拒绝，绝不再打 /rs1（真扣时长）。"""
+    with tempfile.TemporaryDirectory() as d:
+        _isolate(Path(d))
+        pool.save_pool({"active": 0, "cards": [{"email": "a@x", "cardCode": "A"}]})
+        calls = []
+
+        def fake(path, code):
+            calls.append(path)
+            if path == pool.R1_PATH:
+                return {"limitReached": True}
+            return {"success": True, "token": "R" * 40}
+
+        pool._post = fake
+        ok, _token, action, _idx, _detail = pool.renew_next_card()
+        assert ok and action == "reset", (ok, action)
+        card = pool.load_pool()["cards"][0]
+        assert card["resetCount"] == 1 and card["resetDayCount"] == 1, card
+
+        # 当天第二次：只在 /r1 报满后本地拦下
+        calls.clear()
+        ok, _token, action, _idx, detail = pool.renew_next_card()
+        assert not ok and action == "failed" and "reset-capped" in detail, detail
+        assert pool.RS1_PATH not in calls, calls
+        assert pool.snapshot()["cards"][0]["resetDayCount"] == 1
+
+        # 累计上限独立于当日计数
+        p = pool.load_pool()
+        p["cards"][0] = {"email": "a@x", "cardCode": "A",
+                         "resetCount": pool.RESET_LIFETIME_MAX, "resetDate": "", }
+        pool.save_pool(p)
+        assert pool.reset_capped(pool.load_pool()["cards"][0]) == "累计重置已达上限 10 次"
+        calls.clear()
+        assert pool.renew_next_card()[2] == "failed"
+        assert pool.RS1_PATH not in calls, calls
+
+
+def test_history_records_action_and_index():
+    """history 能区分 renew / reset / failed，并带上卡池下标。"""
+    with tempfile.TemporaryDirectory() as d:
+        _isolate(Path(d))
+        pool.save_pool({
+            "active": 0,
+            "cards": [{"email": "a@x", "cardCode": "A"}, {"email": "b@x", "cardCode": "B"}],
+        })
+        pool._post = lambda path, code: {"success": True, "token": "Z" * 40}
+        since = time.time() * 1000
+        pool.trigger_quota_switch("cursor-admin")
+        assert pool.wait_for_quota_renewal(since, timeout_s=10)
+
+        pool._post = lambda path, code: (
+            {"limitReached": True} if path == pool.R1_PATH else {"success": True, "token": "R" * 40}
+        )
+        since = time.time() * 1000
+        pool.trigger_quota_switch("cursor-admin")
+        assert pool.wait_for_quota_renewal(since, timeout_s=10)
+
+        p = pool.load_pool()
+        p["cards"] = [{"email": "dead@x", "cardCode": "D"}]
+        p["active"] = 0
+        pool.save_pool(p)
+        pool._post = lambda path, code: {"success": False, "message": "无效卡密"}
+        since = time.time() * 1000
+        pool.trigger_quota_switch("cursor-admin")
+        assert pool.wait_for_quota_renewal(since, timeout_s=10) is False
+
+        history = pool.load_history()
+        assert [h["action"] for h in history] == ["failed", "reset", "renew"], history
+        assert history[2]["card"] == "a@x" and history[2]["index"] == 0, history[2]
+        assert history[0]["card"] == "" and "无效卡密" in history[0]["message"], history[0]
 
 
 if __name__ == "__main__":

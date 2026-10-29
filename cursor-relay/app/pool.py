@@ -187,6 +187,40 @@ def effective_daily_total(daily: dict) -> int:
     return (resets + 1) * 60
 
 
+# 单卡充能重置的本地配额：扣的是卡时长，云端不设限，本地必须自己兜住
+RESET_PER_DAY = 1
+RESET_LIFETIME_MAX = 10
+
+
+def card_expired(card: dict) -> bool:
+    """endTime 非空且已过 -> 不再拿去云端试。
+
+    支持 "2026-10-29" / "2026-10-29 12:00:00"；日期型按当天 00:00 算过期
+    （ponytail: 云端没给时分就用零点，够用）。
+    """
+    raw = str(card.get("endTime") or "").strip()
+    if not raw:
+        return False
+    text = raw.replace("/", "-").replace("T", " ")[:19]
+    for fmt, size in (("%Y-%m-%d %H:%M:%S", 19), ("%Y-%m-%d", 10)):
+        try:
+            return time.mktime(time.strptime(text[:size], fmt)) < time.time()
+        except Exception:
+            continue
+    return False
+
+
+def reset_capped(card: dict) -> str:
+    """返回拒绝原因，空串表示还能重置。"""
+    total = int(card.get("resetCount") or 0)
+    if total >= RESET_LIFETIME_MAX:
+        return f"累计重置已达上限 {RESET_LIFETIME_MAX} 次"
+    if str(card.get("resetDate") or "") == time.strftime("%Y-%m-%d"):
+        if int(card.get("resetDayCount") or 0) >= RESET_PER_DAY:
+            return f"今日已重置 {RESET_PER_DAY} 次"
+    return ""
+
+
 def auto_renew_enabled() -> bool:
     raw = _read_json(AUTO_RENEW_FILE, {})
     return isinstance(raw, dict) and bool(raw.get("enabled"))
@@ -261,11 +295,18 @@ def _ok(res: dict) -> bool:
 
 
 def renew_card(card: dict) -> tuple[bool, str, str]:
-    """Renew one card. Returns (ok, token, message)."""
+    """Renew one card. Returns (ok, token, message)；成功且 message=="reset"
+    表示走的是扣时长充能重置额度，否则 message 为空串。"""
     code = str(card.get("cardCode") or "")
+    if card_expired(card):
+        return False, "", "expired: 卡已过期"
 
     res = _post(R1_PATH, code)
     if res.get("limitReached"):
+        blocked = reset_capped(card)
+        if blocked:
+            # 本地配额用完就别再打 /rs1，那一步是真扣时长的
+            return False, "", f"reset-capped: {blocked}"
         write_state(
             "resetting",
             "卡密今日额度已满，正在自动扣时长充能重置额度(+60次)...",
@@ -273,6 +314,13 @@ def renew_card(card: dict) -> tuple[bool, str, str]:
         )
         rs = _post(RS1_PATH, code)
         if _ok(rs):
+            today = time.strftime("%Y-%m-%d")
+            same_day = str(card.get("resetDate") or "") == today
+            card["resetCount"] = int(card.get("resetCount") or 0) + 1
+            card["resetDate"] = today
+            card["resetDayCount"] = (
+                int(card.get("resetDayCount") or 0) + 1 if same_day else 1
+            )
             bump_daily("resets")
             return True, _token_of(rs), "reset"
         # KYA: 扣时长重置未通过 -> 直接轮换备用卡密，不再重试本卡
@@ -289,15 +337,16 @@ def renew_card(card: dict) -> tuple[bool, str, str]:
     return False, "", str(res.get("message") or "云端 API 换号未返回有效凭据")
 
 
-def renew_next_card() -> tuple[bool, str, str]:
+def renew_next_card() -> tuple[bool, str, str, int, str]:
     """Walk the pool from the active card; first success wins.
 
     与 KYA rotateToNextCard 一致：只向后轮换、不绕回池首；池尾仍失败才报错。
+    返回 (ok, token, action, index, detail)，action ∈ renew|reset|failed。
     """
     pool = load_pool()
     cards = pool["cards"]
     if not cards:
-        return False, "", "卡池为空，请先在管理页添加卡密"
+        return False, "", "failed", -1, "卡池为空，请先在管理页添加卡密"
 
     start = pool.get("active", 0) % len(cards)
     errors = []
@@ -317,32 +366,39 @@ def renew_next_card() -> tuple[bool, str, str]:
             pool["active"] = idx
             save_pool(pool)
             write_active_token(token)
-            return True, token, label
+            return True, token, "reset" if msg == "reset" else "renew", idx, label
+        # renew_card 可能已在该卡上写了计数，先落盘再跳下一张
+        save_pool(pool)
         errors.append(f"{label}: {msg}")
-    return False, "", " | ".join(errors)
+    return False, "", "failed", -1, " | ".join(errors)
 
 
 # ------------------------------------------------- relay-compatible surface
 def _worker(reason: str = "manual") -> None:
     global _running
     try:
-        ok, _token, detail = renew_next_card()
+        ok, _token, action, index, detail = renew_next_card()
     except Exception as exc:
-        ok, detail = False, f"{type(exc).__name__}: {exc}"
+        ok, action, index, detail = False, "failed", -1, f"{type(exc).__name__}: {exc}"
     add_history(
         {
             "at": int(time.time()),
             "ok": ok,
+            "action": action,
+            "index": index,
             "card": detail if ok else "",
             "message": "" if ok else detail,
             "deviceId": device_id(),
             "reason": reason,
         }
     )
+    state_msg = detail
+    if ok:
+        state_msg = "扣时长重置额度完成(+60次)" if action == "reset" else "极速换号完成"
     write_state(
         "success" if ok else "error",
-        "极速换号完成" if ok else detail,
-        "completed" if ok else "failed",
+        state_msg,
+        "completed" if ok else "pool-exhausted",
     )
     print(
         f"[cursor-relay] renewal {'ok' if ok else 'failed'} ({reason}): {detail}",
@@ -454,6 +510,13 @@ def snapshot() -> dict:
                 "endTime": card.get("endTime") or "",
                 "renewCount": int(card.get("renewCount") or 0),
                 "lastRenewAt": card.get("lastRenewAt") or 0,
+                "resetCount": int(card.get("resetCount") or 0),
+                "resetDate": card.get("resetDate") or "",
+                "resetDayCount": int(card.get("resetDayCount") or 0)
+                if str(card.get("resetDate") or "") == time.strftime("%Y-%m-%d")
+                else 0,
+                "expired": card_expired(card),
+                "resetCapped": reset_capped(card),
                 "active": idx == pool.get("active", 0),
             }
         )
@@ -482,3 +545,65 @@ def snapshot() -> dict:
         },
         "history": load_history()[:SNAPSHOT_HISTORY],
     }
+
+
+if __name__ == "__main__":
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        CARDS_FILE = root / "cards.json"
+        HISTORY_FILE = root / "renewal_history.json"
+        DAILY_FILE = root / "daily_switch.json"
+        AUTO_RENEW_FILE = root / "auto_renew.json"
+        DEVICE_ID_FILE = root / "device_id.txt"
+        ACTIVE_TOKEN = root / "active_token"
+        STATE_FILE = root / "state.json"
+
+        script: list[dict] = []
+        calls: list[tuple[str, str]] = []
+
+        def fake_post(path: str, code: str) -> dict:
+            calls.append((path, code))
+            return script.pop(0) if script else {"success": False, "message": "无脚本"}
+
+        _post = fake_post
+
+        save_pool(
+            {
+                "active": 0,
+                "cards": [
+                    {"cardCode": "OLD", "email": "old@x.com", "endTime": "2020-01-01"},
+                    {"cardCode": "A", "email": "a@x.com"},
+                ],
+            }
+        )
+
+        # 过期卡一次云端都不打，直接跳到下一张；A 撞额度 -> 扣时长重置成功
+        script[:] = [{"limitReached": True}, {"success": True, "token": "t" * 32}]
+        ok, _tok, action, idx, detail = renew_next_card()
+        assert ok and action == "reset" and idx == 1 and detail == "a@x.com", detail
+        assert calls == [(R1_PATH, "A"), (RS1_PATH, "A")], calls
+
+        card = load_pool()["cards"][1]
+        assert card["resetCount"] == 1 and card["resetDayCount"] == 1, card
+        assert card["resetDate"] == time.strftime("%Y-%m-%d") and card["renewCount"] == 1
+        assert load_daily()["resets"] == 1 and read_active_token() == "t" * 32
+
+        # 当天第二次：本地拒绝，不再打 /rs1（那一步真扣时长）
+        calls.clear()
+        script[:] = [{"limitReached": True}]
+        ok, _tok, action, idx, detail = renew_next_card()
+        assert not ok and action == "failed" and "reset-capped" in detail, detail
+        assert (RS1_PATH, "A") not in calls, calls
+
+        # 累计上限 10 次
+        pool = load_pool()
+        pool["cards"][1]["resetCount"] = RESET_LIFETIME_MAX
+        save_pool(pool)
+        assert reset_capped(load_pool()["cards"][1]) == "累计重置已达上限 10 次"
+
+        # 快照把配额与过期状态一并吐给管理页
+        snap = snapshot()["cards"]
+        assert snap[0]["expired"] is True and snap[1]["resetCount"] == RESET_LIFETIME_MAX
+        print("ok  pool self-check")
