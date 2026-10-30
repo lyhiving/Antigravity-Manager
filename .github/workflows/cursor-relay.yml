@@ -26,6 +26,10 @@ jobs:
       - name: Sanity check pool decision tree
         run: python3 cursor-relay/test_pool.py
 
+      # app/direct.py 同样是标准库，帧格式与解码器无需装 litellm 即可验证
+      - name: Sanity check AgentService wire format
+        run: python3 cursor-relay/test_direct.py
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 

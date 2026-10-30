@@ -3,14 +3,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import os
 import secrets
 from pathlib import Path
 
-import uvicorn
 from fastapi import Depends, Header, HTTPException
 from fastapi.responses import HTMLResponse
+from hypercorn.asyncio import serve
+from hypercorn.config import Config as HyperConfig
 
 import pool
 import relay
@@ -163,8 +165,14 @@ async def reset_device() -> dict:
 def main() -> None:
     host = os.environ.get("KYA_PROXY_HOST", "0.0.0.0")
     port = int(os.environ.get("KYA_PROXY_PORT", "8317"))
-    print(f"[cursor-relay] listening on http://{host}:{port}", flush=True)
-    uvicorn.run(app, host=host, port=port, log_level="warning")
+    config = HyperConfig()
+    config.bind = [f"{host}:{port}"]
+    # h2c: cleartext HTTP/2 (prior knowledge) alongside http/1.1 on the same port
+    config.h2_insecure = True
+    config.loglevel = "warning"
+    config.accesslog = None
+    print(f"[cursor-relay] listening on http://{host}:{port} (h2c enabled)", flush=True)
+    asyncio.run(serve(app, config))
 
 
 if __name__ == "__main__":

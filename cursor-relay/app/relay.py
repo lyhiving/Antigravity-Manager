@@ -20,6 +20,7 @@ Env:
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import json
 import os
@@ -33,14 +34,17 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
+import httpx
 import litellm
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from litellm import CustomLLM, completion
 from litellm.types.utils import GenericStreamingChunk
 from litellm.utils import custom_llm_setup
-import uvicorn
+from hypercorn.asyncio import serve
+from hypercorn.config import Config as HyperConfig
 
+import direct
 import logdb
 
 HOST = os.environ.get("KYA_PROXY_HOST", "127.0.0.1")
@@ -1188,6 +1192,52 @@ def wait_for_quota_renewal(since_ms: float, timeout_s: float = QUOTA_WAIT_TIMEOU
     return False
 
 
+# ---------------------------------------------------------------------------
+# Direct Cursor backend — same RPC the CLI uses, minus the subprocess.
+# Wire format lives in direct.py (stdlib only, CI-checked by test_direct.py).
+# Text-only ("llm" exec mode) maps 1:1; tool turns still need the CLI exec loop.
+# ---------------------------------------------------------------------------
+
+class _DirectUnavailable(Exception):
+    """Direct backend unusable before any token was emitted — safe to fall back."""
+
+
+def _direct_stream_once(prompt: str, attempt: "_StreamAttempt") -> Iterator[str]:
+    """One AgentService/Run call; mirrors _iter_agent_stream_once's contract."""
+    sync_auth_from_active_token()
+    token = _read_active_token()
+    if len(token) < 20:
+        raise _DirectUnavailable("no active token")
+    body = direct.build_frames(prompt, str(uuid.uuid4()))
+    try:
+        with httpx.Client(http2=True, timeout=AGENT_TIMEOUT_S) as client:
+            with client.stream(
+                "POST",
+                direct.HOST + direct.PATH,
+                headers=direct.headers(token),
+                content=body,
+            ) as resp:
+                if resp.status_code != 200:
+                    detail = resp.read()[:300].decode("utf-8", "ignore")
+                    raise _DirectUnavailable(f"HTTP {resp.status_code}: {detail}")
+                for delta in direct.iter_deltas(resp.iter_raw()):
+                    attempt.emitted = True
+                    attempt.text += delta
+                    yield delta
+    except _DirectUnavailable:
+        raise
+    except Exception as exc:  # network / protocol failure
+        if attempt.emitted:
+            attempt.err = attempt.err or str(exc)
+            return
+        raise _DirectUnavailable(str(exc)) from exc
+    if is_quota_exhausted(attempt.text):
+        attempt.quota = True
+        attempt.err = attempt.err or "quota exhausted"
+    elif not attempt.emitted:
+        attempt.err = attempt.err or "cursor direct: empty response"
+
+
 def _agent_popen(prompt: str, *, stream_json: bool) -> subprocess.Popen:
     if not prompt.strip():
         raise RuntimeError("empty prompt")
@@ -1443,9 +1493,18 @@ def _renew_and_prepare_retry(attempt: int, *, reason: str = "quota") -> None:
 
 def _iter_agent_stream_once(prompt: str, attempt: _StreamAttempt) -> Iterator[str]:
     """
-    Live-yield assistant text deltas from one cursor-agent run.
+    Live-yield assistant text deltas from one cursor run.
     Sets attempt.emitted / .quota / .err / .text; does not renew.
     """
+    if direct.ENABLED and current_exec_mode() == "llm":
+        try:
+            yield from _direct_stream_once(prompt, attempt)
+            return
+        except _DirectUnavailable as exc:
+            print(
+                f"[cursor-relay] direct unavailable ({exc}); falling back to cursor-agent",
+                flush=True,
+            )
     proc = _agent_popen(prompt, stream_json=True)
     assert proc.stdout is not None
     last_snap = ""
@@ -2124,7 +2183,7 @@ def _has_content(chunk: bytes) -> bool:
 async def _logged_stream(body_iterator, status, write, started):
     """流式响应包一层：流结束才落库，duration 与 Rust monitor 中间件一致算全程。"""
     # ponytail: BaseHTTPMiddleware 把路由内异常推迟到 body 发完后才抛出，这一层看不到，
-    # 中途断流会记成 200/error=None；要精确捕获需改成纯 ASGI 中间件（uvicorn 侧仍有堆栈）。
+    # 中途断流会记成 200/error=None；要精确捕获需改成纯 ASGI 中间件（服务端侧仍有堆栈）。
     error = None
     ttft_ms = None
     captured: list[str] = []
@@ -2222,9 +2281,12 @@ async def add_cors(request: Request, call_next):
 
 
 def main() -> None:
-    # ready marker for ObjC waiter
-    print(f"[kya_llm_proxy] starting on http://{HOST}:{PORT} (litellm+cursor-agent)", flush=True)
-    uvicorn.run(app, host=HOST, port=PORT, log_level="warning")
+    config = HyperConfig()
+    config.bind = [f"{HOST}:{PORT}"]
+    config.h2_insecure = True
+    config.loglevel = "warning"
+    print(f"[cursor-relay] starting on http://{HOST}:{PORT} (direct+cursor-agent, h2c)", flush=True)
+    asyncio.run(serve(app, config))
 
 
 if __name__ == "__main__":
