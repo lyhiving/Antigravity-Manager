@@ -66,7 +66,12 @@ export interface StructuredPayloadData {
         cachedTokens?: number | null;
         totalTokens?: number;
     };
+    /** 解析失败时保留的原文（SSE、纯文本 prompt 或被上游按字节截断的 JSON）。 */
+    rawText?: string;
 }
+
+/** 上游/客户端在请求体达到上限时的截断标记，如 `…[truncated 30744 chars]`。 */
+const TRUNCATION_MARKER = /\[(?:hapi:\s*)?truncated \d+ chars\]/i;
 
 /**
  * 智能解析大模型请求或响应 JSON，适配 Gemini, Claude, OpenAI, Antigravity 各种格式
@@ -78,7 +83,9 @@ export function parsePayloadToStructured(rawJsonText: string, isResponse: boolea
     try {
         obj = JSON.parse(rawJsonText);
     } catch {
-        return null;
+        // 报文可能是 SSE、纯文本 prompt，或被上游按字节截断成非法 JSON；
+        // 保留原文交给界面回退渲染，否则会被误判成「无报文」。
+        return { isStructured: false, messages: [], tools: [], config: {}, rawText: rawJsonText };
     }
 
     if (!obj || typeof obj !== 'object') return null;
@@ -389,6 +396,8 @@ export function parsePayloadToStructured(rawJsonText: string, isResponse: boolea
         data.config.model
     ) {
         data.isStructured = true;
+    } else {
+        data.rawText = rawJsonText;
     }
 
     return data;
@@ -436,10 +445,39 @@ export const StructuredPayloadView: React.FC<StructuredPayloadViewProps> = ({
     };
 
     if (!parsed || !parsed.isStructured) {
+        if (!parsed?.rawText) {
+            return (
+                <div className="h-full flex flex-col items-center justify-center p-8 text-center text-gray-400 select-none">
+                    <Brain size={32} className="mb-2 opacity-30 text-gray-400" />
+                    <span className="text-xs">{t('monitor.details.structured_not_detected', '未检测到结构化大模型指令（点击右上角查看完整代码）')}</span>
+                </div>
+            );
+        }
+
+        const rawText = parsed.rawText;
+        const truncated = TRUNCATION_MARKER.test(rawText);
+
         return (
-            <div className="h-full flex flex-col items-center justify-center p-8 text-center text-gray-400 select-none">
-                <Brain size={32} className="mb-2 opacity-30 text-gray-400" />
-                <span className="text-xs">{t('monitor.details.structured_not_detected', '未检测到结构化大模型指令（点击右上角查看完整代码）')}</span>
+            <div className="h-full flex flex-col min-h-0 bg-gray-50/50 dark:bg-base-100 font-sans">
+                <div className="px-3 py-2 shrink-0 flex items-center justify-between gap-2 border-b border-gray-200 dark:border-base-300 bg-white dark:bg-base-200">
+                    <span className={`text-[11px] font-bold ${truncated ? 'text-amber-700 dark:text-amber-300' : 'text-gray-600 dark:text-gray-400'}`}>
+                        {truncated
+                            ? t('monitor.details.payload_truncated', '报文不是合法 JSON：已在截断标记处被上游按字节截断，以下是原始文本')
+                            : t('monitor.details.payload_not_json', '报文不是 JSON（SSE 流或纯文本 prompt），以下是原始文本')}
+                    </span>
+                    <button
+                        type="button"
+                        onClick={() => handleCopy(rawText, 'raw')}
+                        className="btn btn-ghost btn-xs h-6 px-2 text-[10px] gap-1 shrink-0 text-gray-600 dark:text-gray-300"
+                        title={t('common.copy', '复制')}
+                    >
+                        {copiedIndex === 'raw' ? <Check size={11} className="text-emerald-500" /> : <Copy size={11} />}
+                        <span>{copiedIndex === 'raw' ? t('common.copied', '已复制') : t('common.copy', '复制')}</span>
+                    </button>
+                </div>
+                <pre className="flex-1 min-h-0 overflow-auto p-3 font-mono text-[11px] whitespace-pre-wrap leading-relaxed text-gray-800 dark:text-gray-200 select-text">
+                    {rawText}
+                </pre>
             </div>
         );
     }
