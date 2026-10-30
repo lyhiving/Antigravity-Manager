@@ -2994,7 +2994,7 @@ pub async fn handle_list_models(State(state): State<AppState>) -> impl IntoRespo
         get_all_dynamic_models(&state.custom_mapping, Some(&state.token_manager), only_raw).await;
     // Cursor 由独立 relay 承接，模型不来自 Antigravity 配额表，需显式补上
     if !model_ids.iter().any(|m| m.starts_with("cursor-")) {
-        model_ids.push("cursor-local".to_string());
+        model_ids.push("cursor-auto".to_string());
     }
     let metadata_map = get_all_dynamic_models_metadata(
         &state.custom_mapping,
