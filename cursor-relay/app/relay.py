@@ -1235,7 +1235,8 @@ def _direct_stream_once(prompt: str, attempt: "_StreamAttempt") -> Iterator[str]
         attempt.quota = True
         attempt.err = attempt.err or "quota exhausted"
     elif not attempt.emitted:
-        attempt.err = attempt.err or "cursor direct: empty response"
+        # 一个 delta 都没拿到就当直连不可用，交给 CLI 路径再试一次
+        raise _DirectUnavailable("empty response")
 
 
 def _agent_popen(prompt: str, *, stream_json: bool) -> subprocess.Popen:
