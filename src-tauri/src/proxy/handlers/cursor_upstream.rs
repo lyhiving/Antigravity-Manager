@@ -29,17 +29,37 @@ async fn try_forward(
     headers: &HeaderMap,
     body: &Value,
 ) -> Result<Response, (StatusCode, String)> {
-    let key = std::env::var("CURSOR_UPSTREAM_KEY").unwrap_or_else(|_| "sk-kya-cursor".to_string());
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(TIMEOUT_S))
         .build()
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("cursor upstream client: {e}")))?;
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("cursor upstream client: {e}"),
+            )
+        })?;
 
     let mut req = client
         .post(format!("{UPSTREAM}{path}"))
-        .header(header::AUTHORIZATION, format!("Bearer {key}"))
         .header(header::CONTENT_TYPE, "application/json")
         .json(body);
+
+    // 鉴权沿用 Antigravity 管理端的 key（路由层已校验过客户端），不引入第二套密钥。
+    // relay 与本进程共用同一个 API_KEY，因此这里直取即可。
+    match std::env::var("API_KEY") {
+        Ok(key) if !key.is_empty() => {
+            req = req.header(header::AUTHORIZATION, format!("Bearer {key}"));
+        }
+        _ => {
+            if let Some(v) = headers
+                .get(header::AUTHORIZATION)
+                .cloned()
+                .or_else(|| headers.get("x-api-key").cloned())
+            {
+                req = req.header(header::AUTHORIZATION, v);
+            }
+        }
+    }
 
     // 客户端 UA 决定 relay 的 dialect(Claude/Cursor/OpenAI)，版本头决定 Anthropic 特性协商。
     for name in [
