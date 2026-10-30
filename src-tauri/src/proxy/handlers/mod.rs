@@ -4,6 +4,8 @@
 pub mod audio; // 音频转录处理器
 pub mod claude;
 pub mod common;
+pub mod cursor_upstream; // cursor-* 模型转发到本地 relay
+
 pub mod gemini;
 pub mod openai;
 pub mod thinking; // 思考块会话结束/查询

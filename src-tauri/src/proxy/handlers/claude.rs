@@ -881,6 +881,12 @@ pub async fn handle_messages(
     >,
     Json(body): Json<Value>,
 ) -> Response {
+    // cursor-* 由本地 relay 承接，不进 Antigravity 管线
+    if let Some(model) = body.get("model").and_then(|v| v.as_str()) {
+        if super::cursor_upstream::is_cursor_model(model) {
+            return super::cursor_upstream::forward("/v1/messages", &headers, &body).await;
+        }
+    }
     // [FIX] 保存原始请求体的完整副本，用于日志记录
     // 这确保了即使结构体定义遗漏字段，日志也能完整记录所有参数
     let original_body = body.clone();
@@ -2984,8 +2990,12 @@ pub async fn handle_list_models(State(state): State<AppState>) -> impl IntoRespo
     };
 
     let only_raw = *state.only_raw_quota_models.read().await;
-    let model_ids =
+    let mut model_ids =
         get_all_dynamic_models(&state.custom_mapping, Some(&state.token_manager), only_raw).await;
+    // Cursor 由独立 relay 承接，模型不来自 Antigravity 配额表，需显式补上
+    if !model_ids.iter().any(|m| m.starts_with("cursor-")) {
+        model_ids.push("cursor-local".to_string());
+    }
     let metadata_map = get_all_dynamic_models_metadata(
         &state.custom_mapping,
         Some(&state.token_manager),

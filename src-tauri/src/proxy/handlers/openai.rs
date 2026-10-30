@@ -2038,6 +2038,10 @@ pub async fn handle_chat_completions(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_lowercase();
+    // cursor-* 由本地 relay 承接，不进 Antigravity 管线
+    if super::cursor_upstream::is_cursor_model(&model_name) {
+        return Ok(super::cursor_upstream::forward("/v1/chat/completions", &headers, &body).await);
+    }
     // [FIX] Only redirect non-native image aliases (dall-e / midjourney) to the
     // images-generations shim. Native Gemini image models (gemini-3-pro-image*) must
     // flow through the normal pipeline (transform_openai_request -> resolve_request_config),
@@ -5608,8 +5612,12 @@ pub async fn handle_list_models(State(state): State<AppState>) -> impl IntoRespo
     };
 
     let only_raw = *state.only_raw_quota_models.read().await;
-    let model_ids =
+    let mut model_ids =
         get_all_dynamic_models(&state.custom_mapping, Some(&state.token_manager), only_raw).await;
+    // Cursor 由独立 relay 承接，模型不来自 Antigravity 配额表，需显式补上
+    if !model_ids.iter().any(|m| m.starts_with("cursor-")) {
+        model_ids.push("cursor-local".to_string());
+    }
     let metadata_map = get_all_dynamic_models_metadata(
         &state.custom_mapping,
         Some(&state.token_manager),
@@ -5677,6 +5685,22 @@ pub async fn handle_retrieve_model(
     };
 
     let only_raw = *state.only_raw_quota_models.read().await;
+    if super::cursor_upstream::is_cursor_model(&model) {
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "id": model,
+                "object": "model",
+                "created": 1706745600,
+                "owned_by": "cursor",
+                "context_length": 200000,
+                "max_context_length": 200000,
+                "max_input_tokens": 200000,
+                "max_output_tokens": 32000,
+            })),
+        )
+            .into_response();
+    }
     let resolved_id = if let Some(matched_id) = find_dynamic_model(
         &state.custom_mapping,
         Some(&state.token_manager),
