@@ -1497,7 +1497,7 @@ def _iter_agent_stream_once(prompt: str, attempt: _StreamAttempt) -> Iterator[st
     Live-yield assistant text deltas from one cursor run.
     Sets attempt.emitted / .quota / .err / .text; does not renew.
     """
-    if direct.ENABLED and current_exec_mode() == "llm":
+    if direct.ENABLED and (current_exec_mode() == "llm" or direct.AGENT):
         try:
             yield from _direct_stream_once(prompt, attempt)
             return

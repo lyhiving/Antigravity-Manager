@@ -20,6 +20,9 @@ from typing import Any, Iterable, Iterator, Tuple
 HOST = os.environ.get("KYA_DIRECT_HOST", "https://agentn.global.api5.cursor.sh").rstrip("/")
 PATH = "/agent.v1.AgentService/Run"
 ENABLED = os.environ.get("KYA_PROXY_DIRECT", "1").strip() != "0"
+# agent 模式默认也走直连：CLI 只提供文本，进程启动白烧 ~4s 首字节。
+# 需要 CLI 自己的工具循环(--yolo)时置 KYA_PROXY_DIRECT_AGENT=0。
+AGENT = os.environ.get("KYA_PROXY_DIRECT_AGENT", "1").strip() != "0"
 
 # AgentRunRequest.requested_model: "default" = whatever the account resolves to.
 MODEL = os.environ.get("KYA_PROXY_DIRECT_MODEL", "default")
