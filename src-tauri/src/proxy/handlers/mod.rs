@@ -4,7 +4,7 @@
 pub mod audio; // 音频转录处理器
 pub mod claude;
 pub mod common;
-pub mod cursor_upstream; // cursor-* 模型转发到本地 relay
+pub mod cursor_upstream; // cursor-auto 按模型名转发到本地 relay
 
 pub mod gemini;
 pub mod openai;

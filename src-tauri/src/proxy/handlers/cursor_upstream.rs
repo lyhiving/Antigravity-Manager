@@ -12,9 +12,10 @@ use std::time::Duration;
 const UPSTREAM: &str = "http://127.0.0.1:8317";
 const TIMEOUT_S: u64 = 900;
 
-/// 只有显式 `cursor-` 前缀的模型走 relay；`auto` 等泛名仍归 Antigravity 的别名映射。
+/// 仅当模型名为 `cursor-auto` 时走 relay；其它名字一律走 Antigravity 正常管线。
+/// 鉴权（管理 key / 用户 key）在路由层已完成，这里只做模型分发。
 pub fn is_cursor_model(model: &str) -> bool {
-    model.trim().to_ascii_lowercase().starts_with("cursor-")
+    model.trim().eq_ignore_ascii_case("cursor-auto")
 }
 
 pub async fn forward(path: &str, headers: &HeaderMap, body: &Value) -> Response {
@@ -46,6 +47,7 @@ async fn try_forward(
 
     // 鉴权沿用 Antigravity 管理端的 key（路由层已校验过客户端），不引入第二套密钥。
     // relay 与本进程共用同一个 API_KEY，因此这里直取即可。
+    // 管理 key / 用户 key 的校验逻辑不在这里改，本文件只负责按模型转发。
     match std::env::var("API_KEY") {
         Ok(key) if !key.is_empty() => {
             req = req.header(header::AUTHORIZATION, format!("Bearer {key}"));

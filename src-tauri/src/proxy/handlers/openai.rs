@@ -3524,6 +3524,20 @@ pub async fn handle_completions(
     Json(mut body): Json<Value>,
 ) -> Response {
     let clean_start = std::time::Instant::now();
+    // cursor-auto：鉴权已过，只按模型名分发到本地 relay（含 /v1/responses）
+    let model_name = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if super::cursor_upstream::is_cursor_model(&model_name) {
+        let path = if is_responses_api_path(uri.path()) {
+            "/v1/responses"
+        } else {
+            "/v1/chat/completions"
+        };
+        return super::cursor_upstream::forward(path, &headers, &body).await;
+    }
     debug!(
         "Received /v1/completions or /v1/responses payload: {} bytes",
         serialized_json_len(&body)
