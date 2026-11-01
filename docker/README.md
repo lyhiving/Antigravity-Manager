@@ -95,10 +95,35 @@ docker run -d \
 > - **回退機制**: 如果上述兩者皆未設置，則回退使用 `API_KEY`；若連 `API_KEY` 也未設置，則隨機生成。
 
 ### 2. 使用 Docker Compose
-在 `docker` 目錄下執行：
+在項目根目錄執行（僅 Manager）：
 ```bash
-docker compose up -d
+docker compose -f docker/docker-compose.yml up -d
 ```
+
+#### 2.1 與 cursor-relay 同棧編排（推薦，本 fork）
+對外入口仍是 **8045**：客戶端用 `cursor-auto`，由 Manager 轉發到本機 sidecar **8317**。
+鏡像與進程保持分離，只做 compose 共啟停、共享 `ABV_HOST_DATA_DIR`。
+
+```bash
+# 根目錄；可先複製 docker/.env.example → docker/.env 或項目根 .env
+docker compose \
+  -f docker/docker-compose.yml \
+  -f docker/docker-compose.cursor-relay.yml \
+  up -d
+
+# 本地構建 sidecar（改了 cursor-relay/ 時）
+docker compose \
+  -f docker/docker-compose.yml \
+  -f docker/docker-compose.cursor-relay.yml \
+  up -d --build
+```
+
+| 端口 | 誰聽 | 誰該打 |
+| :--- | :--- | :--- |
+| `8045` | antigravity-manager | 客戶端 / Web UI / `cursor-auto` |
+| `8317` | cursor-relay sidecar | 僅本機（Manager 轉發、可選 `/cursor` 反代） |
+
+`KYA_PROXY_KEY` 默認跟 `API_KEY`，否則 8045→8317 轉發會 401。
 
 ### 3. 手動構建鏡像 (開發者 / 二改版)
 如果您需要修改代碼或自定義構建，請在項目根目錄下執行：
@@ -155,6 +180,8 @@ docker build --build-arg USE_MIRROR=true -t antigravity-manager:latest -f docker
 ## 🌐 訪問位址
 *   **管理界面**: [http://localhost:8045](http://localhost:8045)
 *   **API Base**: [http://localhost:8045/v1](http://localhost:8045/v1)
+*   **Cursor 模型**: 同一 Base，模型名 `cursor-auto`（需同棧 sidecar 健康）
+*   **Cursor 管理頁**: Manager 內「Cursor 中轉」；生產可將 `/cursor/` 反代到 `127.0.0.1:8317`
 
 ## 📦 Docker Hub 分發 (推薦)
 若要推送至你的倉庫：

@@ -1,8 +1,13 @@
-# s303 独立栈（与主栈并行，不共用 compose 项目）：
-#   cd /data/cursor-relay && docker compose up -d
+# 独立 sidecar 应急栈（与 Manager 分项目启动）。
+# 推荐编排（同栈共启）见:
+#   docker compose -f docker/docker-compose.yml -f docker/docker-compose.cursor-relay.yml up -d
+#
+# 本文件用途:
+#   cd cursor-relay && docker compose up -d
 #
 # 主栈用 network_mode: host，relay 同样走 host，直接占用 8317。
 # 与 antigravity-manager 共用 ABV_DATA_DIR，卡池数据落在 <数据目录>/cursor/cards.json。
+# 对外客户端仍走 Manager:8045（模型 cursor-auto）；8317 仅本机转发。
 
 services:
   cursor-relay:

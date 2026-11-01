@@ -1,0 +1,73 @@
+# Manager(8045) + cursor-relay(8317) 同栈编排。
+# 对外仍只暴露 8045：cursor-auto 由 Manager 转发到本机 8317 sidecar。
+#
+# 用法（在项目根目录）:
+#   docker compose -f docker/docker-compose.yml -f docker/docker-compose.cursor-relay.yml up -d
+# 本地构建 sidecar 镜像:
+#   docker compose -f docker/docker-compose.yml -f docker/docker-compose.cursor-relay.yml up -d --build
+#
+# 仅 Manager（不含 Cursor）: docker compose -f docker/docker-compose.yml up -d
+# 仅 sidecar（应急）: 见 cursor-relay/docker-compose.yml
+
+services:
+  antigravity-manager:
+    volumes:
+      - ${ABV_HOST_DATA_DIR:-~/.antigravity_tools}:/root/.antigravity_tools
+    environment:
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - API_KEY=${API_KEY:-changeme}
+      - WEB_PASSWORD=${WEB_PASSWORD:-}
+      - ABV_API_KEY=${API_KEY:-changeme}
+      - ABV_WEB_PASSWORD=${WEB_PASSWORD:-}
+      - ABV_BIND_LOCAL_ONLY=${ABV_BIND_LOCAL_ONLY:-true}
+      - ABV_DATA_DIR=${ABV_DATA_DIR:-/root/.antigravity_tools}
+      - ABV_MAX_BODY_SIZE=${ABV_MAX_BODY_SIZE:-104857600}
+    depends_on:
+      cursor-relay:
+        condition: service_healthy
+
+  cursor-relay:
+    build:
+      context: ../cursor-relay
+      dockerfile: Dockerfile
+    image: ${CURSOR_RELAY_IMAGE:-ghcr.io/lyhiving/cursor-relay:latest}
+    container_name: cursor-relay
+    # 有本地 build 时优先用本地；拉远程时可用 CURSOR_RELAY_PULL=always
+    pull_policy: ${CURSOR_RELAY_PULL:-missing}
+    network_mode: host
+    restart: unless-stopped
+    # docker-default 会挡住 cursor-agent 的 socketpair；与独立栈保持一致
+    security_opt:
+      - apparmor:unconfined
+      - seccomp:unconfined
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+      - 1.0.0.1
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "3"
+    environment:
+      KYA_PROXY_HOST: 0.0.0.0
+      KYA_PROXY_PORT: "8317"
+      # 必须与 Manager 的 API_KEY 一致：cursor_upstream 用同一 Bearer 转发
+      KYA_PROXY_KEY: ${CURSOR_RELAY_KEY:-${API_KEY:-changeme}}
+      ABV_DATA_DIR: /root/.antigravity_tools
+      CURSOR_ADMIN_PASSWORD: ${CURSOR_ADMIN_PASSWORD:-${WEB_PASSWORD:-}}
+      CURSOR_RENEW_WAIT_S: ${CURSOR_RENEW_WAIT_S:-120}
+    volumes:
+      - ${ABV_HOST_DATA_DIR:-~/.antigravity_tools}:/root/.antigravity_tools
+      - cursor-relay-state:/root/.cursor
+      - cursor-relay-tk:/root/.cursor-tk
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8317/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+volumes:
+  cursor-relay-state:
+  cursor-relay-tk:
