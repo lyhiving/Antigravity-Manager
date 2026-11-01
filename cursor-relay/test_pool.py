@@ -19,6 +19,7 @@ def _isolate(tmp: Path) -> None:
     pool.DEVICE_ID_FILE = tmp / "device_id.txt"
     pool.DAILY_FILE = tmp / "daily_switch.json"
     pool.AUTO_RENEW_FILE = tmp / "auto_renew.json"
+    pool.BANNED_CARDS_FILE = tmp / "banned_cards.json"
     # 多数用例走 auto 触发路径，默认打开开关；开关语义本身由专门用例覆盖
     pool.set_auto_renew(True)
     pool.RETRY_SLEEP_S = 0
@@ -131,8 +132,8 @@ def test_pool_rotates_past_dead_key():
         assert pool.load_daily()["switches"] == 0, "轮换备用卡后今日换号计数应清零"
 
 
-def test_pool_does_not_wrap_to_earlier_cards():
-    """KYA rotateToNextCard: nextIdx >= pool.count 即失败，不绕回池首。"""
+def test_pool_wraps_around_to_available_cards():
+    """环形轮换：active 卡密不可用时，自动向前绕回并尝试可用卡密。"""
     with tempfile.TemporaryDirectory() as d:
         _isolate(Path(d))
         pool.save_pool({
@@ -148,10 +149,10 @@ def test_pool_does_not_wrap_to_earlier_cards():
             return {"success": False, "message": "无效卡密"}
 
         pool._post = fake
-        ok, _token, action, _idx, _detail = pool.renew_next_card()
-        assert not ok and action == "failed", (ok, action)
-        assert seen and set(seen) == {"DEAD"}, seen
-        assert pool.load_pool()["active"] == 1
+        ok, token, action, idx, detail = pool.renew_next_card()
+        assert ok and action == "renew" and idx == 0 and token == "L" * 40, (ok, action, idx, token)
+        assert seen == ["DEAD", "LIVE"], seen
+        assert pool.load_pool()["active"] == 0
 
 
 def test_pool_reports_only_after_all_keys_fail():
@@ -191,7 +192,36 @@ def test_wait_times_out_when_renewal_fails():
         pool.trigger_quota_switch("test")
         assert pool.wait_for_quota_renewal(since, timeout_s=10) is False
         state = pool.read_state()
-        assert state["status"] == "error" and state["phase"] == "pool-exhausted", state
+        assert state["status"] == "error" and state["phase"] in ("all_cards_exhausted", "pool-exhausted"), state
+
+
+def test_banned_card_auto_marked_and_skipped():
+    """检测到永久封禁或无效信息时，自动写入封禁表并不再重试。"""
+    with tempfile.TemporaryDirectory() as d:
+        _isolate(Path(d))
+        pool.save_pool({
+            "active": 0,
+            "cards": [{"email": "bad@x", "cardCode": "BAD"}, {"email": "good@x", "cardCode": "GOOD"}],
+        })
+        calls = []
+
+        def fake(path, code):
+            calls.append(code)
+            if code == "BAD":
+                return {"success": False, "message": "卡密已被永久封禁"}
+            return {"success": True, "token": "G" * 40}
+
+        pool._post = fake
+        ok, token, action, idx, detail = pool.renew_next_card()
+        assert ok and action == "renew" and idx == 1, (ok, action, idx)
+        assert pool.is_card_banned("BAD") is True
+        assert pool.load_pool()["active"] == 1
+
+        # 第二次换号：BAD 卡由于已标记封禁，一次网络请求都不打
+        calls.clear()
+        ok2, token2, action2, idx2, detail2 = pool.renew_next_card()
+        assert ok2 and idx2 == 1
+        assert "BAD" not in calls
 
 
 def test_manual_switch_skipped_during_cooldown():

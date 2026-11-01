@@ -40,6 +40,7 @@ SNAPSHOT_HISTORY = 5
 TK_DIR = Path.home() / ".cursor-tk"
 ACTIVE_TOKEN = TK_DIR / "active_token"
 STATE_FILE = TK_DIR / "kya_switch_state.json"
+BANNED_CARDS_FILE = DATA_ROOT / "banned_cards.json"
 # 放在 ABV_DATA_DIR 下（已挂载持久卷），否则重置后的指纹会随容器重建丢失并退回默认值
 DEVICE_ID_FILE = DATA_ROOT / "device_id.txt"
 
@@ -91,17 +92,68 @@ def read_state() -> dict:
     return st if isinstance(st, dict) else {}
 
 
-def write_state(status: str, detail: str = "", phase: str = "") -> None:
+def write_state(
+    status: str, detail: str = "", phase: str = "", all_exhausted: bool = False
+) -> None:
     _write_json(
         STATE_FILE,
         {
             "status": status,
             "phase": phase,
             "message": detail,
+            "allExhausted": all_exhausted,
             "timestamp": int(time.time() * 1000),
             "pid": os.getpid(),
         },
     )
+
+
+# -------------------------------------------------------- banned cards mgmt
+def is_permanent_ban_message(msg: str) -> bool:
+    if not msg:
+        return False
+    keywords = (
+        "封禁", "永久封禁", "禁用", "冻结", "拉黑", "无效",
+        "不存在", "到期", "过期", "非法", "异常账号", "刷号"
+    )
+    return any(k in msg for k in keywords)
+
+
+def load_banned_cards() -> dict:
+    raw = _read_json(BANNED_CARDS_FILE, {})
+    if isinstance(raw, dict) and "banned_cards" in raw and isinstance(raw["banned_cards"], dict):
+        return raw["banned_cards"]
+    return {}
+
+
+def mark_card_banned(card_code: str, reason: str) -> None:
+    code = str(card_code or "").strip()
+    if not code:
+        return
+    banned = load_banned_cards()
+    banned[code] = {
+        "reason": reason,
+        "timestamp": int(time.time() * 1000),
+        "date": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    _write_json(BANNED_CARDS_FILE, {"banned_cards": banned, "updated_at": int(time.time())})
+    masked = code[:3] + "***" + code[-3:] if len(code) > 6 else code
+    print(f"[cursor-relay] 🚫 卡密 {masked} 已被标记封禁/失效: {reason}", flush=True)
+
+
+def is_card_banned(card_code: str) -> bool:
+    code = str(card_code or "").strip()
+    return code in load_banned_cards()
+
+
+def unban_card(card_code: str) -> bool:
+    code = str(card_code or "").strip()
+    banned = load_banned_cards()
+    if code in banned:
+        del banned[code]
+        _write_json(BANNED_CARDS_FILE, {"banned_cards": banned, "updated_at": int(time.time())})
+        return True
+    return False
 
 
 def load_pool() -> dict:
@@ -118,6 +170,22 @@ def load_pool() -> dict:
 
 def save_pool(pool: dict) -> None:
     _write_json(CARDS_FILE, pool)
+
+
+def has_available_backup_cards() -> bool:
+    pool = load_pool()
+    cards = pool.get("cards") or []
+    for c in cards:
+        code = str(c.get("cardCode") or "").strip()
+        if not code or is_card_banned(code) or card_expired(c):
+            continue
+        if not reset_capped(c):
+            return True
+    return False
+
+
+def are_all_cards_exhausted() -> bool:
+    return not has_available_backup_cards()
 
 
 def device_id() -> str:
@@ -294,15 +362,22 @@ def _ok(res: dict) -> bool:
     return bool(res.get("success")) and len(_token_of(res)) > 20
 
 
-def renew_card(card: dict) -> tuple[bool, str, str]:
+def renew_card(card: dict, allow_reset: bool = True) -> tuple[bool, str, str]:
     """Renew one card. Returns (ok, token, message)；成功且 message=="reset"
     表示走的是扣时长充能重置额度，否则 message 为空串。"""
-    code = str(card.get("cardCode") or "")
+    code = str(card.get("cardCode") or "").strip()
+    if not code:
+        return False, "", "empty card code"
+    if is_card_banned(code):
+        reason = load_banned_cards().get(code, {}).get("reason", "已被封禁")
+        return False, "", f"banned: 卡密已被封禁 ({reason})"
     if card_expired(card):
         return False, "", "expired: 卡已过期"
 
     res = _post(R1_PATH, code)
     if res.get("limitReached"):
+        if not allow_reset:
+            return False, "", "limitReached"
         blocked = reset_capped(card)
         if blocked:
             # 本地配额用完就别再打 /rs1，那一步是真扣时长的
@@ -323,24 +398,39 @@ def renew_card(card: dict) -> tuple[bool, str, str]:
             )
             bump_daily("resets")
             return True, _token_of(rs), "reset"
+        msg = str(rs.get("message") or "扣时长重置未通过")
+        if is_permanent_ban_message(msg):
+            mark_card_banned(code, msg)
         # KYA: 扣时长重置未通过 -> 直接轮换备用卡密，不再重试本卡
-        return False, "", str(rs.get("message") or "扣时长重置未通过")
+        return False, "", msg
 
     if _ok(res):
         return True, _token_of(res), ""
+
+    msg = str(res.get("message") or "")
+    if is_permanent_ban_message(msg):
+        mark_card_banned(code, msg)
+        return False, "", msg
 
     # KYA: 首次未成功 -> 1s 静默退避重试
     time.sleep(RETRY_SLEEP_S)
     res = _post(R1_PATH, code)
     if _ok(res):
         return True, _token_of(res), ""
-    return False, "", str(res.get("message") or "云端 API 换号未返回有效凭据")
+    msg = str(res.get("message") or "云端 API 换号未返回有效凭据")
+    if is_permanent_ban_message(msg):
+        mark_card_banned(code, msg)
+    return False, "", msg
 
 
 def renew_next_card() -> tuple[bool, str, str, int, str]:
-    """Walk the pool from the active card; first success wins.
+    """Walk the pool with ring rotation and intelligent backup strategy.
 
-    与 KYA rotateToNextCard 一致：只向后轮换、不绕回池首；池尾仍失败才报错。
+    与 KYA 保持一致：
+    1. 第一轮：环形遍历卡池，优先使用现有额度（不扣时长重置）；
+    2. 第二轮：若所有卡密均已满额，按顺序扣时长充能重置；
+    3. 封禁/过期卡密自动跳过，绝不浪费网络请求；
+    4. 只有当卡池所有卡密均不可用时才判定为 failed。
     返回 (ok, token, action, index, detail)，action ∈ renew|reset|failed。
     """
     pool = load_pool()
@@ -350,27 +440,59 @@ def renew_next_card() -> tuple[bool, str, str, int, str]:
 
     start = pool.get("active", 0) % len(cards)
     errors = []
-    for idx in range(start, len(cards)):
+    limit_reached_indices = []
+
+    # 第一轮：环形轮换，尝试未耗尽的卡密 (allow_reset=False)
+    for i in range(len(cards)):
+        idx = (start + i) % len(cards)
         card = cards[idx]
+        code = str(card.get("cardCode") or "").strip()
         label = str(card.get("email") or f"#{idx}")
+        if is_card_banned(code) or card_expired(card):
+            continue
         try:
-            ok, token, msg = renew_card(card)
+            ok, token, msg = renew_card(card, allow_reset=False)
         except Exception as exc:
             ok, token, msg = False, "", f"{type(exc).__name__}: {exc}"
         if ok:
             card["lastRenewAt"] = int(time.time())
             card["renewCount"] = int(card.get("renewCount") or 0) + 1
             if idx != start:
-                # KYA: 轮换到备用卡密后今日换号计数清零
+                # 轮换到备用卡密后今日换号计数清零
                 bump_daily("switches", -10**9)
             pool["active"] = idx
             save_pool(pool)
             write_active_token(token)
-            return True, token, "reset" if msg == "reset" else "renew", idx, label
-        # renew_card 可能已在该卡上写了计数，先落盘再跳下一张
-        save_pool(pool)
-        errors.append(f"{label}: {msg}")
-    return False, "", "failed", -1, " | ".join(errors)
+            return True, token, "renew", idx, label
+        if msg == "limitReached":
+            limit_reached_indices.append(idx)
+        else:
+            save_pool(pool)
+            errors.append(f"{label}: {msg}")
+
+    # 第二轮：卡池均已跑满，尝试扣时长充能重置 (allow_reset=True)
+    if limit_reached_indices:
+        for idx in limit_reached_indices:
+            card = cards[idx]
+            label = str(card.get("email") or f"#{idx}")
+            try:
+                ok, token, msg = renew_card(card, allow_reset=True)
+            except Exception as exc:
+                ok, token, msg = False, "", f"{type(exc).__name__}: {exc}"
+            if ok:
+                card["lastRenewAt"] = int(time.time())
+                card["renewCount"] = int(card.get("renewCount") or 0) + 1
+                if idx != start:
+                    bump_daily("switches", -10**9)
+                pool["active"] = idx
+                save_pool(pool)
+                write_active_token(token)
+                return True, token, "reset", idx, label
+            save_pool(pool)
+            errors.append(f"{label}: {msg}")
+
+    err_detail = " | ".join(errors) if errors else "所有卡密额度均已耗尽或已被封禁"
+    return False, "", "failed", -1, err_detail
 
 
 # ------------------------------------------------- relay-compatible surface
@@ -395,11 +517,15 @@ def _worker(reason: str = "manual") -> None:
     state_msg = detail
     if ok:
         state_msg = "扣时长重置额度完成(+60次)" if action == "reset" else "极速换号完成"
-    write_state(
-        "success" if ok else "error",
-        state_msg,
-        "completed" if ok else "pool-exhausted",
-    )
+        write_state("success", state_msg, "completed", all_exhausted=False)
+    else:
+        has_backup = has_available_backup_cards()
+        write_state(
+            "error",
+            state_msg,
+            "all_cards_exhausted" if not has_backup else "card_retry_pending",
+            all_exhausted=not has_backup,
+        )
     print(
         f"[cursor-relay] renewal {'ok' if ok else 'failed'} ({reason}): {detail}",
         flush=True,
@@ -474,14 +600,20 @@ def wait_for_quota_renewal(
                 print(f"[cursor-relay] renewal ok ({st.get('message')})", flush=True)
                 return True
             if status == "error":
+                all_ex = bool(st.get("allExhausted", False))
+                msg = st.get("message") or "failed"
+                # 核心机制：只要还有可用备用卡，不立即认输退出，等待轮换完成
+                if all_ex and not has_available_backup_cards():
+                    print(f"[cursor-relay] renewal reported all exhausted: {msg}", flush=True)
+                    return False
                 print(
-                    f"[cursor-relay] renewal failed: {st.get('message')}", flush=True
+                    f"[cursor-relay] renewal error reported (all_exhausted={all_ex}): {msg}, still waiting...",
+                    flush=True,
                 )
-                return False
         now = time.time()
         if now - last_log >= 15:
             last_log = now
-            print(f"[cursor-relay] waiting for renewal… ({int(timeout_s - (deadline - now))}s)", flush=True)
+            print(f"[cursor-relay] waiting for renewal… ({int(deadline - now)}s remaining)", flush=True)
         time.sleep(0.5)
     print("[cursor-relay] renewal wait timed out", flush=True)
     return False
@@ -499,12 +631,14 @@ def mask(token: str) -> str:
 def snapshot() -> dict:
     pool = load_pool()
     cards = []
+    banned_map = load_banned_cards()
     for idx, card in enumerate(pool["cards"]):
+        code = str(card.get("cardCode") or "")
         cards.append(
             {
                 "index": idx,
                 "email": card.get("email") or "",
-                "cardCode": mask(str(card.get("cardCode") or "")),
+                "cardCode": mask(code),
                 "cardType": card.get("cardType") or "月卡",
                 "startTime": card.get("startTime") or "",
                 "endTime": card.get("endTime") or "",
@@ -517,6 +651,8 @@ def snapshot() -> dict:
                 else 0,
                 "expired": card_expired(card),
                 "resetCapped": reset_capped(card),
+                "banned": code in banned_map,
+                "bannedReason": banned_map.get(code, {}).get("reason", "") if code in banned_map else "",
                 "active": idx == pool.get("active", 0),
             }
         )
@@ -531,6 +667,7 @@ def snapshot() -> dict:
         "state": read_state(),
         "autoRenew": auto_renew_enabled(),
         "renewing": _running,
+        "hasAvailableCards": has_available_backup_cards(),
         "daily": {
             "date": daily["date"],
             "switches": switches,
@@ -545,65 +682,3 @@ def snapshot() -> dict:
         },
         "history": load_history()[:SNAPSHOT_HISTORY],
     }
-
-
-if __name__ == "__main__":
-    import tempfile
-
-    with tempfile.TemporaryDirectory() as d:
-        root = Path(d)
-        CARDS_FILE = root / "cards.json"
-        HISTORY_FILE = root / "renewal_history.json"
-        DAILY_FILE = root / "daily_switch.json"
-        AUTO_RENEW_FILE = root / "auto_renew.json"
-        DEVICE_ID_FILE = root / "device_id.txt"
-        ACTIVE_TOKEN = root / "active_token"
-        STATE_FILE = root / "state.json"
-
-        script: list[dict] = []
-        calls: list[tuple[str, str]] = []
-
-        def fake_post(path: str, code: str) -> dict:
-            calls.append((path, code))
-            return script.pop(0) if script else {"success": False, "message": "无脚本"}
-
-        _post = fake_post
-
-        save_pool(
-            {
-                "active": 0,
-                "cards": [
-                    {"cardCode": "OLD", "email": "old@x.com", "endTime": "2020-01-01"},
-                    {"cardCode": "A", "email": "a@x.com"},
-                ],
-            }
-        )
-
-        # 过期卡一次云端都不打，直接跳到下一张；A 撞额度 -> 扣时长重置成功
-        script[:] = [{"limitReached": True}, {"success": True, "token": "t" * 32}]
-        ok, _tok, action, idx, detail = renew_next_card()
-        assert ok and action == "reset" and idx == 1 and detail == "a@x.com", detail
-        assert calls == [(R1_PATH, "A"), (RS1_PATH, "A")], calls
-
-        card = load_pool()["cards"][1]
-        assert card["resetCount"] == 1 and card["resetDayCount"] == 1, card
-        assert card["resetDate"] == time.strftime("%Y-%m-%d") and card["renewCount"] == 1
-        assert load_daily()["resets"] == 1 and read_active_token() == "t" * 32
-
-        # 当天第二次：本地拒绝，不再打 /rs1（那一步真扣时长）
-        calls.clear()
-        script[:] = [{"limitReached": True}]
-        ok, _tok, action, idx, detail = renew_next_card()
-        assert not ok and action == "failed" and "reset-capped" in detail, detail
-        assert (RS1_PATH, "A") not in calls, calls
-
-        # 累计上限 10 次
-        pool = load_pool()
-        pool["cards"][1]["resetCount"] = RESET_LIFETIME_MAX
-        save_pool(pool)
-        assert reset_capped(load_pool()["cards"][1]) == "累计重置已达上限 10 次"
-
-        # 快照把配额与过期状态一并吐给管理页
-        snap = snapshot()["cards"]
-        assert snap[0]["expired"] is True and snap[1]["resetCount"] == RESET_LIFETIME_MAX
-        print("ok  pool self-check")

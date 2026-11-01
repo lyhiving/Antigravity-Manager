@@ -34,6 +34,11 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
+# LiteLLM's import fetches the model cost map from raw.githubusercontent.com;
+# behind CN network that is 3 SSL retries (~10s) before it drops to the bundled
+# copy. Must be set before the import to take effect.
+os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+
 import httpx
 import litellm
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -71,7 +76,7 @@ QUOTA_EXHAUSTED_RE = re.compile(
     re.IGNORECASE,
 )
 TK_DIR = Path.home() / ".cursor-tk"
-MAX_QUOTA_RETRIES = int(os.environ.get("KYA_PROXY_QUOTA_RETRIES", "2"))
+MAX_QUOTA_RETRIES = int(os.environ.get("KYA_PROXY_QUOTA_RETRIES", "6"))
 QUOTA_WAIT_TIMEOUT_S = float(os.environ.get("KYA_PROXY_QUOTA_WAIT_S", "120"))
 AGENT_TIMEOUT_S = float(os.environ.get("KYA_PROXY_AGENT_TIMEOUT_S", "180"))
 # Per-request: "llm" (ask, no tools) | "agent" (full tools). Anthropic defaults to llm.
@@ -269,17 +274,29 @@ def messages_to_prompt(messages: list) -> str:
             "",
         ]
         if tools:
-            names: List[str] = []
+            sigs: List[str] = []
             for t in tools[:80]:
                 if not isinstance(t, dict):
                     continue
-                # Anthropic: name; OpenAI: function.name or name
-                n = t.get("name")
-                if not n and isinstance(t.get("function"), dict):
-                    n = t["function"].get("name")
-                if n:
-                    names.append(str(n))
-            name_hint = ", ".join(names[:40]) if names else "(see tool list in conversation)"
+                # Anthropic: name/input_schema; OpenAI: function.name/function.parameters
+                fn = t.get("function") if isinstance(t.get("function"), dict) else {}
+                n = t.get("name") or fn.get("name")
+                if not n:
+                    continue
+                schema = t.get("input_schema") or fn.get("parameters") or {}
+                if not isinstance(schema, dict):
+                    schema = {}
+                props = list((schema.get("properties") or {}).keys())
+                req = set(schema.get("required") or [])
+                if props:
+                    # Parameter names must be spelled exactly — guessing (path vs
+                    # file_path) makes every call fail validation.
+                    sigs.append(
+                        f"{n}(" + ", ".join(p + ("*" if p in req else "") for p in props[:8]) + ")"
+                    )
+                else:
+                    sigs.append(str(n))
+            name_hint = "\n  ".join(sigs[:40]) if sigs else "(see tool list in conversation)"
             if dialect == "claude":
                 lines += [
                     "IMPORTANT: Reply in ONE shot. Do not explore with Cursor/Task/subagents.",
@@ -292,7 +309,8 @@ def messages_to_prompt(messages: list) -> str:
                     "    <parameter name=\"arg\">value</parameter>",
                     "  </invoke>",
                     "You may include a short prose line before any <invoke>.",
-                    f"Allowed tool names (subset): {name_hint}",
+                    "Allowed tools — name(required*, optional). Use these exact parameter names:",
+                    f"  {name_hint}",
                     "If no tools are needed, output a complete prose answer only.",
                     "",
                 ]
@@ -302,7 +320,8 @@ def messages_to_prompt(messages: list) -> str:
                     "When you need tools, emit OpenAI-native tool_calls JSON only (one object):",
                     '{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"TOOL_NAME","arguments":"{\\"arg\\":\\"value\\"}"}}]}',
                     "You may include a short prose line before the JSON object.",
-                    f"Allowed function names (subset): {name_hint}",
+                    "Allowed functions — name(required*, optional). Use these exact parameter names:",
+                    f"  {name_hint}",
                     "If no tools are needed, output prose only.",
                     "",
                 ]
@@ -428,6 +447,145 @@ def _dedupe_calls(calls: List[dict]) -> List[dict]:
         seen.add(key)
         uniq.append(c)
     return uniq
+
+
+def _tool_schema_map(tools: List[dict]) -> Dict[str, dict]:
+    """name -> JSON schema. Anthropic uses input_schema; OpenAI/Codex use function.parameters."""
+    out: Dict[str, dict] = {}
+    for t in tools or []:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function") if isinstance(t.get("function"), dict) else {}
+        n = t.get("name") or fn.get("name")
+        if not n:
+            continue
+        schema = t.get("input_schema") or fn.get("parameters") or t.get("parameters") or {}
+        out[str(n)] = schema if isinstance(schema, dict) else {}
+    return out
+
+
+def _coerce_tool_input(args: Any, schema: dict) -> Tuple[Dict[str, Any], List[str]]:
+    """Repair near-miss args (path vs file_path) and declared types. Returns (args, problems)."""
+    props = schema.get("properties") if isinstance(schema, dict) else None
+    props = props if isinstance(props, dict) else {}
+    required = [r for r in (schema.get("required") or []) if isinstance(r, str)]
+    if not isinstance(args, dict):
+        args = {"_raw": args} if args not in (None, "") else {}
+    args = dict(args)
+
+    # Near-miss rename: one missing required param vs one surplus key.
+    for _ in range(2):
+        missing = [r for r in required if r not in args]
+        if not missing:
+            break
+        surplus = [k for k in args if k not in props]
+        if len(missing) == 1 and len(surplus) == 1:
+            args[missing[0]] = args.pop(surplus[0])
+            continue
+        renamed = False
+        for m in missing:
+            for s in list(surplus):
+                if s.endswith(m) or m.endswith(s):
+                    args[m] = args.pop(s)
+                    renamed = True
+                    break
+            if renamed:
+                break
+        if not renamed:
+            break
+
+    for k, v in list(args.items()):
+        spec = props.get(k) if isinstance(props.get(k), dict) else {}
+        typ = spec.get("type")
+        if typ == "string" and not isinstance(v, str):
+            args[k] = str(v)
+        elif typ in ("number", "integer") and isinstance(v, str):
+            try:
+                args[k] = int(v) if typ == "integer" else float(v)
+            except ValueError:
+                pass
+        elif typ == "boolean" and isinstance(v, str) and v.lower() in ("true", "false"):
+            args[k] = v.lower() == "true"
+
+    problems = []
+    missing = [r for r in required if r not in args]
+    if missing:
+        problems.append("missing required: " + ", ".join(missing))
+    return args, problems
+
+
+def _apply_schema_to_calls(
+    calls: List[dict], tools: List[dict]
+) -> Tuple[List[dict], List[str]]:
+    """Dialect-agnostic arg repair — the part that works without another round-trip."""
+    schemas = _tool_schema_map(tools)
+    fixed: List[dict] = []
+    problems: List[str] = []
+    for c in calls or []:
+        name = str(c.get("name") or "")
+        schema = schemas.get(name)
+        if schema is None:
+            fixed.append(c)
+            continue
+        args, probs = _coerce_tool_input(c.get("input"), schema)
+        fixed.append({"name": name, "input": args})
+        problems.extend(f"{name}: {p}" for p in probs)
+    return _dedupe_calls(fixed), problems
+
+
+def tool_contract_nudge(prompt: str, problems: List[str]) -> str:
+    detail = "\n".join(f"- {p}" for p in problems[:8])
+    return (
+        f"{prompt.rstrip()}\n\n"
+        "===== SYSTEM NUDGE =====\n"
+        "Your tool calls failed schema validation:\n"
+        f"{detail}\n"
+        "Re-emit them using ONLY the exact parameter names from the tool signatures. "
+        "Do not rename, invent, or omit required parameters.\n"
+    )
+
+
+def run_agent_with_tool_contract(
+    prompt: str, tools: List[dict], dialect: str
+) -> Tuple[str, List[dict]]:
+    """
+    One agent round-trip + schema repair + at most one corrective retry.
+    Shared by every client dialect (claude / codex / cursor / openai).
+    """
+    raw = run_cursor_agent_with_quota_retry(prompt)
+    prose, calls = extract_tool_calls_for_dialect(raw, tools, dialect)
+    if not tools:
+        return prose, calls
+
+    calls, problems = _apply_schema_to_calls(calls, tools)
+
+    if not calls and looks_like_incomplete_assistant_turn(prose, calls):
+        print(
+            "[kya_llm_proxy] tool contract: narration without tools; nudging once",
+            flush=True,
+        )
+        retry = run_cursor_agent_with_quota_retry(incomplete_turn_nudge(prompt))
+        if retry:
+            raw = f"{raw}\n{retry}".strip()
+            prose, calls = extract_tool_calls_for_dialect(raw, tools, dialect)
+            calls, problems = _apply_schema_to_calls(calls, tools)
+
+    if calls and problems:
+        print(
+            "[kya_llm_proxy] tool contract: fixing args "
+            + "; ".join(problems[:4]),
+            flush=True,
+        )
+        retry = run_cursor_agent_with_quota_retry(
+            tool_contract_nudge(prompt, problems)
+        )
+        if retry:
+            p2, calls2 = extract_tool_calls_for_dialect(retry, tools, dialect)
+            calls2, _ = _apply_schema_to_calls(calls2, tools)
+            if calls2:
+                prose, calls = (p2 or prose), calls2
+
+    return prose, calls
 
 
 # "invoke Grep with pattern foo path /tmp glob *.{ts,tsx}"
@@ -996,6 +1154,7 @@ def iter_anthropic_sse_live(
             raise RuntimeError(last_err)
 
         prose, tool_calls = extract_tool_calls_for_dialect(raw, tools, dialect)
+        tool_calls, _arg_problems = _apply_schema_to_calls(tool_calls, tools)
 
         # One nudge if the model only said "接着读…" without tool_use — otherwise Claude ends the turn.
         if looks_like_incomplete_assistant_turn(prose, tool_calls) and tools:
@@ -1020,6 +1179,7 @@ def iter_anthropic_sse_live(
                 raw_parts.append(nudge_raw)
                 raw = "\n".join(raw_parts).strip()
                 prose, tool_calls = extract_tool_calls_for_dialect(raw, tools, dialect)
+                tool_calls, _arg_problems = _apply_schema_to_calls(tool_calls, tools)
 
         if tool_calls:
             print(
@@ -1829,6 +1989,58 @@ def get_model(
     }
 
 
+def are_all_cards_exhausted() -> bool:
+    """Check if all renewal cards in pool are exhausted or banned."""
+    try:
+        if hasattr(sys.modules.get("pool"), "are_all_cards_exhausted"):
+            return bool(sys.modules["pool"].are_all_cards_exhausted())
+    except Exception:
+        pass
+    try:
+        state_file = TK_DIR / "kya_switch_state.json"
+        if state_file.is_file():
+            st = json.loads(state_file.read_text(encoding="utf-8"))
+            if st.get("allExhausted") is True or st.get("phase") == "all_cards_exhausted":
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def map_proxy_exception(e: Exception, dialect: str = "openai") -> HTTPException:
+    msg = str(e)
+    is_quota_err = any(k in msg.lower() for k in ("quota", "exhausted", "limit", "429"))
+    all_exhausted = are_all_cards_exhausted()
+
+    if is_quota_err and all_exhausted:
+        status_code = 429
+        err_type = "insufficient_quota"
+        msg = f"All renewal cards exhausted / Quota limit reached: {msg}"
+        headers = {}
+    elif is_quota_err and not all_exhausted:
+        # 只要卡池中仍有可用备用卡或处于换号重试中，返回 503 引导客户端优雅重试，绝不报 429！
+        status_code = 503
+        err_type = "service_unavailable"
+        msg = f"Cursor quota hit; rotating to backup card/account. Please retry momentarily: {msg}"
+        headers = {"Retry-After": "3"}
+    else:
+        status_code = 502
+        err_type = "proxy_error"
+        headers = {}
+
+    if dialect == "claude":
+        return HTTPException(
+            status_code=status_code,
+            detail={"type": "error", "error": {"type": err_type, "message": msg}},
+            headers=headers,
+        )
+    return HTTPException(
+        status_code=status_code,
+        detail={"error": {"message": msg, "type": err_type, "code": status_code}},
+        headers=headers,
+    )
+
+
 @app.post("/v1/chat/completions")
 @app.post("/chat/completions")
 @app.post("/v1/completions")
@@ -1910,6 +2122,9 @@ async def chat_completions(
                     _prose, live_calls = extract_tool_calls_for_dialect(
                         "".join(acc), tools, dialect
                     )
+                    live_calls, _arg_problems = _apply_schema_to_calls(
+                        live_calls, tools
+                    )
                     if live_calls:
                         oc = openai_chat_payload(
                             model=echo_model, prose="", tool_calls=live_calls
@@ -1928,13 +2143,52 @@ async def chat_completions(
                             flush=True,
                         )
                     else:
+                        # Model narrated next steps and never called a tool — the
+                        # client sees a bare "stop" and ends the turn. Nudge once
+                        # and salvage the call before closing the stream.
+                        if looks_like_incomplete_assistant_turn(
+                            "".join(acc), live_calls
+                        ):
+                            print(
+                                "[kya_llm_proxy] chat tools: incomplete turn (narration, no tools); nudging once",
+                                flush=True,
+                            )
+                            nudge_raw = run_cursor_agent_with_quota_retry(
+                                incomplete_turn_nudge(prompt)
+                            )
+                            _np, nudge_calls = extract_tool_calls_for_dialect(
+                                nudge_raw or "", tools, dialect
+                            )
+                            nudge_calls, _ = _apply_schema_to_calls(
+                                nudge_calls, tools
+                            )
+                            if nudge_calls:
+                                oc = openai_chat_payload(
+                                    model=echo_model, prose="", tool_calls=nudge_calls
+                                )["choices"][0]
+                                yield emit(
+                                    {
+                                        "tool_calls": [
+                                            {"index": i, **c}
+                                            for i, c in enumerate(
+                                                oc["message"]["tool_calls"]
+                                            )
+                                        ]
+                                    },
+                                    oc["finish_reason"],
+                                )
+                                print(
+                                    f"[kya_llm_proxy] {dialect}: salvaged {len(nudge_calls)} tool_calls after nudge",
+                                    flush=True,
+                                )
+                                yield "data: [DONE]\n\n"
+                                return
                         yield emit({}, "stop")
                     yield "data: [DONE]\n\n"
 
                 return StreamingResponse(oai_live_sse(), media_type="text/event-stream")
 
-            raw_text = run_cursor_agent_with_quota_retry(prompt)
-            prose, tool_calls = extract_tool_calls_for_dialect(raw_text, tools, dialect)
+            prose, tool_calls = run_agent_with_tool_contract(prompt, tools, dialect)
             if tool_calls:
                 print(
                     f"[kya_llm_proxy] {dialect}: mapped {len(tool_calls)} OpenAI tool_calls",
@@ -1945,9 +2199,7 @@ async def chat_completions(
             )
             return JSONResponse(payload)
         except Exception as e:
-            raise HTTPException(
-                status_code=502, detail={"error": {"message": str(e), "type": "proxy_error"}}
-            ) from e
+            raise map_proxy_exception(e, dialect) from e
 
     _EXEC_MODE.set("agent")
     echo_model = body.get("model") or "cursor-local"
@@ -1986,7 +2238,7 @@ async def chat_completions(
         payload = json.loads(resp.model_dump_json()) if hasattr(resp, "model_dump_json") else resp
         return JSONResponse(payload)
     except Exception as e:
-        raise HTTPException(status_code=502, detail={"error": {"message": str(e), "type": "proxy_error"}}) from e
+        raise map_proxy_exception(e, dialect) from e
 
 
 @app.post("/v1/messages")
@@ -2041,17 +2293,7 @@ async def anthropic_messages(
                 ),
                 media_type="text/event-stream",
             )
-        raw_text = run_cursor_agent_with_quota_retry(prompt)
-        prose, tool_calls = extract_tool_calls_for_dialect(raw_text, tools, dialect)
-        if looks_like_incomplete_assistant_turn(prose, tool_calls) and tools:
-            print(
-                "[kya_llm_proxy] claude: incomplete turn (narration, no tools); nudging once",
-                flush=True,
-            )
-            nudged = run_cursor_agent_with_quota_retry(incomplete_turn_nudge(prompt))
-            if nudged:
-                raw_text = f"{raw_text}\n{nudged}".strip()
-                prose, tool_calls = extract_tool_calls_for_dialect(raw_text, tools, dialect)
+        prose, tool_calls = run_agent_with_tool_contract(prompt, tools, dialect)
         if tool_calls:
             print(
                 f"[kya_llm_proxy] claude: mapped {len(tool_calls)} Anthropic tool_use",
@@ -2062,10 +2304,7 @@ async def anthropic_messages(
         )
         return JSONResponse(payload)
     except Exception as e:
-        raise HTTPException(
-            status_code=502,
-            detail={"type": "error", "error": {"type": "api_error", "message": str(e)}},
-        ) from e
+        raise map_proxy_exception(e, dialect="claude") from e
 
 
 @app.post("/v1/responses")
@@ -2150,7 +2389,7 @@ async def openai_responses(
             }
         )
     except Exception as e:
-        raise HTTPException(status_code=502, detail={"error": {"message": str(e), "type": "proxy_error"}}) from e
+        raise map_proxy_exception(e, dialect="openai") from e
 
 
 @app.options("/{full_path:path}")

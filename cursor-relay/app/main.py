@@ -20,6 +20,7 @@ import relay
 # Only these two are macOS-bound; the rest of relay.py already runs on Linux.
 relay.trigger_quota_switch = pool.trigger_quota_switch
 relay.wait_for_quota_renewal = pool.wait_for_quota_renewal
+relay.are_all_cards_exhausted = pool.are_all_cards_exhausted
 
 app = relay.app
 ADMIN_PASSWORD = os.environ.get("CURSOR_ADMIN_PASSWORD", "")
@@ -149,6 +150,18 @@ async def renew_now() -> dict:
 @app.post("/admin/api/auto-renew", dependencies=[Depends(admin_auth)])
 async def set_auto_renew(payload: dict) -> dict:
     pool.set_auto_renew(bool(payload.get("enabled")))
+    return pool.snapshot()
+
+
+@app.get("/admin/api/banned-cards", dependencies=[Depends(admin_auth)])
+async def get_banned_cards() -> dict:
+    return pool.load_banned_cards()
+
+
+@app.post("/admin/api/banned-cards/unban", dependencies=[Depends(admin_auth)])
+async def unban_card(payload: dict) -> dict:
+    code = str(payload.get("cardCode") or "").strip()
+    pool.unban_card(code)
     return pool.snapshot()
 
 
