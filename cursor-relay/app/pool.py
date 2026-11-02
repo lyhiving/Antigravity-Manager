@@ -33,7 +33,7 @@ DATA_ROOT = Path(
 ) / "cursor"
 CARDS_FILE = DATA_ROOT / "cards.json"
 HISTORY_FILE = DATA_ROOT / "renewal_history.json"
-HISTORY_LIMIT = 200
+HISTORY_LIMIT = 1000
 # 控制台每 5s 轮询 /state，完整列表走独立的 /admin/history 页，这里只回最近几条
 SNAPSHOT_HISTORY = 5
 
@@ -273,6 +273,10 @@ def add_history(entry: dict) -> None:
     items = load_history()
     items.insert(0, entry)
     _write_json(HISTORY_FILE, items[:HISTORY_LIMIT])
+
+
+def clear_history() -> None:
+    _write_json(HISTORY_FILE, [])
 
 
 def load_daily() -> dict:

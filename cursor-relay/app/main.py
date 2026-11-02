@@ -77,15 +77,48 @@ async def admin_state() -> dict:
 
 
 @app.get("/admin/api/history", dependencies=[Depends(admin_auth)])
-async def admin_history(limit: int = 50, offset: int = 0) -> dict:
+async def admin_history(
+    limit: int = 50,
+    offset: int = 0,
+    status: str = "all",
+    reason: str = "all",
+    keyword: str = "",
+) -> dict:
     items = pool.load_history()
+    if status == "success":
+        items = [x for x in items if bool(x.get("ok"))]
+    elif status in ("fail", "failed", "error"):
+        items = [x for x in items if not bool(x.get("ok"))]
+
+    if reason in ("manual", "auto"):
+        items = [x for x in items if str(x.get("reason", "")).lower() == reason]
+
+    if keyword:
+        kw = keyword.strip().lower()
+        if kw:
+            items = [
+                x for x in items
+                if kw in str(x.get("card", "")).lower()
+                or kw in str(x.get("message", "")).lower()
+                or kw in str(x.get("deviceId", "")).lower()
+                or kw in str(x.get("action", "")).lower()
+            ]
+
+    total = len(items)
     offset = max(0, offset)
     limit = min(max(1, limit), pool.HISTORY_LIMIT)
     return {
-        "total": len(items),
+        "total": total,
         "offset": offset,
-        "items": items[offset:offset + limit],
+        "limit": limit,
+        "items": items[offset : offset + limit],
     }
+
+
+@app.post("/admin/api/history/clear", dependencies=[Depends(admin_auth)])
+async def clear_admin_history() -> dict:
+    pool.clear_history()
+    return {"ok": True, "total": 0, "items": []}
 
 
 @app.post("/admin/api/cards", dependencies=[Depends(admin_auth)])

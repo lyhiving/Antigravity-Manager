@@ -1,66 +1,30 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { motion } from 'framer-motion';
-import { MousePointer2, RefreshCw, Zap, Trash2, CheckCircle2, Plus, Loader2, Power } from 'lucide-react';
+import {
+    MousePointer2,
+    RefreshCw,
+    Zap,
+    Trash2,
+    CheckCircle2,
+    Plus,
+    Loader2,
+    Power,
+    History,
+} from 'lucide-react';
 import { showToast } from '../components/common/ToastContainer';
-
-interface RelayCard {
-    index: number;
-    email: string;
-    cardType: string;
-    cardCode: string;
-    active: boolean;
-    renewCount: number;
-    lastRenewAt: number | null;
-}
-
-interface RelayHistory {
-    at: number;
-    ok: boolean;
-    card: string;
-    message: string;
-    deviceId?: string;
-    reason?: 'manual' | 'auto' | string;
-}
-
-interface RelayState {
-    state?: { status?: string; message?: string; phase?: string };
-    activeToken?: string;
-    autoRenew?: boolean;
-    deviceId?: string;
-    cards: RelayCard[];
-    daily?: { date: string; switches: number; resets: number; total: number; remaining: number; cooldownRemaining: number };
-    history?: RelayHistory[];
-}
-
-// 生产环境由 nginx 把 /cursor/ 反代到 relay(8317)；本地开发可用 VITE_CURSOR_RELAY_BASE 覆盖
-const RELAY_BASE = import.meta.env.VITE_CURSOR_RELAY_BASE || '/cursor';
-const API_BASE = `${RELAY_BASE}/admin/api`;
-// 完整续杯记录在独立页面，避免控制台轮询时全量渲染
-const HISTORY_PAGE = `${RELAY_BASE}/admin/history`;
-
-async function relayApi<T>(path: string, body?: unknown): Promise<T> {
-    const key = sessionStorage.getItem('abv_admin_api_key') || '';
-    const res = await fetch(API_BASE + path, {
-        method: body === undefined ? 'GET' : 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
-        body: body === undefined ? undefined : JSON.stringify(body),
-    });
-    if (!res.ok) {
-        let msg = String(res.status);
-        try {
-            msg = (await res.json()).detail || msg;
-        } catch {
-            /* 非 JSON 错误体，保留状态码 */
-        }
-        throw new Error(msg);
-    }
-    return res.json();
-}
+import {
+    type RelayState,
+    relayApi,
+} from '../services/cursorRelayService';
+import RenewalHistoryModal from '../components/cursor/RenewalHistoryModal';
 
 const statusColor = (s?: string) =>
-    s === 'success' ? 'text-green-600 dark:text-green-400'
-        : s === 'error' ? 'text-red-500' : 'text-amber-500';
+    s === 'success'
+        ? 'text-green-600 dark:text-green-400'
+        : s === 'error'
+          ? 'text-red-500'
+          : 'text-amber-500';
 
 const ago = (sec?: number | null) => {
     if (!sec) return '';
@@ -80,6 +44,7 @@ const CursorRelay: React.FC = () => {
     const [busy, setBusy] = useState(false);
     const [email, setEmail] = useState('');
     const [cardCode, setCardCode] = useState('');
+    const [historyModalOpen, setHistoryModalOpen] = useState(false);
     const busyRef = useRef(false);
 
     const load = useCallback(async () => {
@@ -144,13 +109,23 @@ const CursorRelay: React.FC = () => {
                     <MousePointer2 className="text-blue-500" size={22} />
                     {t('cursor_relay.title', 'Cursor 中转')}
                 </h1>
-                <button
-                    onClick={load}
-                    className="btn btn-sm btn-ghost gap-2 text-gray-600 dark:text-gray-400 min-h-11"
-                >
-                    <RefreshCw size={16} />
-                    {t('cursor_relay.refresh', '刷新')}
-                </button>
+                <div className="flex items-center gap-2">
+                    <button
+                        onClick={() => setHistoryModalOpen(true)}
+                        className="btn btn-sm btn-ghost gap-1.5 text-gray-600 dark:text-gray-300 min-h-11"
+                        title={t('cursor_relay.view_all_history', '查看全部')}
+                    >
+                        <History size={16} />
+                        <span className="hidden sm:inline">{t('cursor_relay.history', '续杯记录')}</span>
+                    </button>
+                    <button
+                        onClick={load}
+                        className="btn btn-sm btn-ghost gap-2 text-gray-600 dark:text-gray-400 min-h-11"
+                    >
+                        <RefreshCw size={16} />
+                        {t('cursor_relay.refresh', '刷新')}
+                    </button>
+                </div>
             </div>
 
             {error && (
@@ -182,7 +157,7 @@ const CursorRelay: React.FC = () => {
             <button
                 onClick={() => run('/renew', {}, t('cursor_relay.renewed', '续杯已触发'))}
                 disabled={busy}
-                className="w-full mt-3 min-h-12 rounded-xl bg-blue-600 text-white font-bold flex items-center justify-center gap-2 disabled:opacity-50"
+                className="w-full mt-3 min-h-12 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-bold flex items-center justify-center gap-2 disabled:opacity-50 transition-colors shadow-sm"
             >
                 {busy ? <Loader2 size={18} className="animate-spin" /> : <Zap size={18} />}
                 {t('cursor_relay.renew_now', '立即续杯')}
@@ -199,9 +174,9 @@ const CursorRelay: React.FC = () => {
                     )
                 }
                 disabled={busy}
-                className={`w-full mt-2 min-h-11 rounded-xl border text-sm font-medium flex items-center justify-center gap-2 disabled:opacity-50 ${
+                className={`w-full mt-2 min-h-11 rounded-xl border text-sm font-medium flex items-center justify-center gap-2 disabled:opacity-50 transition-colors ${
                     data?.autoRenew
-                        ? 'border-green-200 text-green-600 dark:border-green-900/40 dark:text-green-400'
+                        ? 'border-green-200 text-green-600 dark:border-green-900/40 dark:text-green-400 bg-green-50/30 dark:bg-green-950/20'
                         : 'border-gray-200 dark:border-base-200 text-gray-600 dark:text-gray-400'
                 }`}
             >
@@ -213,7 +188,7 @@ const CursorRelay: React.FC = () => {
             <button
                 onClick={resetDevice}
                 disabled={busy}
-                className="w-full mt-2 min-h-11 rounded-xl border border-gray-200 dark:border-base-200 text-sm font-medium text-gray-700 dark:text-gray-300 flex items-center justify-center gap-2 disabled:opacity-50"
+                className="w-full mt-2 min-h-11 rounded-xl border border-gray-200 dark:border-base-200 text-sm font-medium text-gray-700 dark:text-gray-300 flex items-center justify-center gap-2 disabled:opacity-50 transition-colors hover:bg-gray-50 dark:hover:bg-base-200"
             >
                 <RefreshCw size={16} />
                 {t('cursor_relay.reset_device', '重置设备 ID')}
@@ -252,7 +227,7 @@ const CursorRelay: React.FC = () => {
                                 <button
                                     onClick={() => run('/active', { index: c.index }, t('cursor_relay.switched', '已切换'))}
                                     disabled={busy || c.active}
-                                    className="flex-1 min-h-11 rounded-lg border border-gray-200 dark:border-base-200 text-sm flex items-center justify-center gap-1.5 disabled:opacity-40 text-gray-700 dark:text-gray-300"
+                                    className="flex-1 min-h-11 rounded-lg border border-gray-200 dark:border-base-200 text-sm flex items-center justify-center gap-1.5 disabled:opacity-40 text-gray-700 dark:text-gray-300 transition-colors hover:bg-gray-50 dark:hover:bg-base-200"
                                 >
                                     <CheckCircle2 size={15} />
                                     {t('cursor_relay.set_active', '设为当前')}
@@ -260,7 +235,7 @@ const CursorRelay: React.FC = () => {
                                 <button
                                     onClick={() => run('/cards/delete', { index: c.index }, t('cursor_relay.deleted', '已删除'))}
                                     disabled={busy}
-                                    className="flex-1 min-h-11 rounded-lg border border-red-200 dark:border-red-900/40 text-sm text-red-500 flex items-center justify-center gap-1.5 disabled:opacity-40"
+                                    className="flex-1 min-h-11 rounded-lg border border-red-200 dark:border-red-900/40 text-sm text-red-500 flex items-center justify-center gap-1.5 disabled:opacity-40 transition-colors hover:bg-red-50 dark:hover:bg-red-950/20"
                                 >
                                     <Trash2 size={15} />
                                     {t('cursor_relay.delete', '删除')}
@@ -276,14 +251,14 @@ const CursorRelay: React.FC = () => {
                     <div className="font-semibold text-sm text-gray-700 dark:text-gray-300">
                         {t('cursor_relay.history', '续杯记录')} <span className="text-gray-400 font-normal">({history.length})</span>
                     </div>
-                    <a
-                        href={HISTORY_PAGE}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="text-xs text-blue-600 dark:text-blue-400 min-h-9 inline-flex items-center"
+                    <button
+                        type="button"
+                        onClick={() => setHistoryModalOpen(true)}
+                        className="text-xs font-semibold text-blue-600 dark:text-blue-400 hover:text-blue-700 dark:hover:text-blue-300 min-h-9 inline-flex items-center gap-1 cursor-pointer transition-colors"
                     >
+                        <History size={13} />
                         {t('cursor_relay.view_all_history', '查看全部')}
-                    </a>
+                    </button>
                 </div>
                 <div className="bg-white dark:bg-base-100 rounded-xl shadow-sm border border-gray-100 dark:border-base-200 divide-y divide-gray-100 dark:divide-base-200">
                     {history.length === 0 && (
@@ -292,7 +267,11 @@ const CursorRelay: React.FC = () => {
                         </p>
                     )}
                     {history.map((h, i) => (
-                        <div key={`${h.at}-${i}`} className="px-4 py-3">
+                        <div
+                            key={`${h.at}-${i}`}
+                            className="px-4 py-3 cursor-pointer hover:bg-gray-50/60 dark:hover:bg-base-200/40 transition-colors"
+                            onClick={() => setHistoryModalOpen(true)}
+                        >
                             <div className="flex items-center justify-between gap-2">
                                 <span className={`text-sm ${h.ok ? 'text-green-600 dark:text-green-400' : 'text-red-500'}`}>
                                     {h.ok ? t('cursor_relay.history_ok', '成功') : t('cursor_relay.history_fail', '失败')}
@@ -339,12 +318,18 @@ const CursorRelay: React.FC = () => {
                 <button
                     onClick={addCard}
                     disabled={busy || !cardCode.trim()}
-                    className="w-full min-h-11 rounded-lg bg-gray-900 dark:bg-white text-white dark:text-gray-900 text-sm font-semibold flex items-center justify-center gap-1.5 disabled:opacity-40"
+                    className="w-full min-h-11 rounded-lg bg-gray-900 dark:bg-white text-white dark:text-gray-900 text-sm font-semibold flex items-center justify-center gap-1.5 disabled:opacity-40 transition-colors"
                 >
                     <Plus size={16} />
                     {t('cursor_relay.add', '添加')}
                 </button>
             </div>
+
+            {/* 续杯历史记录蒙层弹窗 */}
+            <RenewalHistoryModal
+                isOpen={historyModalOpen}
+                onClose={() => setHistoryModalOpen(false)}
+            />
         </motion.div>
     );
 };
