@@ -69,10 +69,13 @@ MODEL_ALIASES = [
 
 # Shared with HAPI cursorAutoRetry — covers Claude/Cursor/OpenAI clients via this proxy.
 QUOTA_EXHAUSTED_RE = re.compile(
-    r"(?:upgrade your plan to continue|"
-    r"you(?:'ve| have) (?:hit|reached) (?:your |the )?(?:current |monthly |free )?"
+    r"(?:upgrade your plan (?:to continue|for more)|"
+    r"(?:weekly|monthly|daily|current|free)?\s*usage limit reached|"
+    r"you(?:'ve| have) (?:hit|reached) (?:your |the )?(?:current |monthly |weekly |free )?"
     r"(?:quota|usage limit|limit)|"
-    r"get cursor pro for more agent usage)",
+    r"get cursor pro for more agent usage|"
+    r"ActionRequiredError:.*(?:usage limit|limit reached|quota)|"
+    r"(?:usage limit|rate limit|quota).*reached)",
     re.IGNORECASE,
 )
 TK_DIR = Path.home() / ".cursor-tk"
@@ -2022,6 +2025,10 @@ def map_proxy_exception(e: Exception, dialect: str = "openai") -> HTTPException:
         headers = {}
     elif is_quota_err and not all_exhausted:
         # 只要卡池中仍有可用备用卡或处于换号重试中，返回 503 引导客户端优雅重试，绝不报 429！
+        try:
+            trigger_quota_switch("quota-exception-fallback")
+        except Exception:
+            pass
         status_code = 503
         err_type = "service_unavailable"
         msg = f"Cursor quota hit; rotating to backup card/account. Please retry momentarily: {msg}"
