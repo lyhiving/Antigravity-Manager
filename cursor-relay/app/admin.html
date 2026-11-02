@@ -96,9 +96,11 @@ function render(d){
         <span class="badge">${esc(c.cardType)}</span>
       </div>
       <div class="k" style="margin-top:4px">${esc(c.cardCode)} · 续杯 ${c.renewCount} 次${c.lastRenewAt ? ' · ' + ago(c.lastRenewAt) : ''}</div>
-      <div class="k">重置 ${c.resetCount}/10 次 · 今日 ${c.resetDayCount}/1${c.expired ? ' · <span class="err">已过期</span>' : ''}${c.resetCapped ? ' · ' + esc(c.resetCapped) : ''}</div>
+      <div class="k">重置 ${c.resetCount}/10 次 · 今日 ${c.resetDayCount}/1${c.expired ? ' · <span class="err">已过期</span>' : ''}${c.resetCapped ? ' · ' + esc(c.resetCapped) : ''}${c.banned ? ' · <span class="err" title="' + esc(c.bannedReason || '') + '">🚫已封禁</span>' : ''}${c.dailyExhausted ? ' · <span class="err" style="color:#d97706">⛔今日耗尽</span>' : ''}</div>
       <div class="actions">
         <button class="ghost" data-use="${c.index}" ${c.active ? 'disabled' : ''}>设为当前</button>
+        ${c.banned ? `<button class="ghost" data-unban="${esc(c.cardCode)}">解封</button>` : ''}
+        ${c.dailyExhausted ? `<button class="ghost" data-unfreeze="${esc(c.cardCode)}">解冻</button>` : ''}
         <button class="danger" data-del="${c.index}">删除</button>
       </div>
     </div>`).join('');
@@ -128,13 +130,20 @@ async function load(){
 
 document.addEventListener('click', async ev => {
   const use = ev.target.dataset.use, del = ev.target.dataset.del;
-  if(use === undefined && del === undefined) return;
+  const unban = ev.target.dataset.unban, unfreeze = ev.target.dataset.unfreeze;
+  if(use === undefined && del === undefined && unban === undefined && unfreeze === undefined) return;
   if(busy) return;
   busy = true;
   try{
-    render(use !== undefined
-      ? await api(API + '/active', {index: Number(use)})
-      : await api(API + '/cards/delete', {index: Number(del)}));
+    if(unban !== undefined){
+      render(await api(API + '/banned-cards/unban', {cardCode: unban}));
+    } else if(unfreeze !== undefined){
+      render(await api(API + '/daily-exhausted/clear', {cardCode: unfreeze}));
+    } else if(use !== undefined){
+      render(await api(API + '/active', {index: Number(use)}));
+    } else {
+      render(await api(API + '/cards/delete', {index: Number(del)}));
+    }
   }catch(e){ alert(e.message); }
   busy = false;
 });

@@ -423,12 +423,19 @@ def test_reset_quota_capped_per_card():
         card = pool.load_pool()["cards"][0]
         assert card["resetCount"] == 1 and card["resetDayCount"] == 1, card
 
-        # 当天第二次：只在 /r1 报满后本地拦下
+        # 当天第二次：只在 /r1 报满后本地拦下并标记当日耗尽
         calls.clear()
         ok, _token, action, _idx, detail = pool.renew_next_card()
-        assert not ok and action == "failed" and "reset-capped" in detail, detail
+        assert not ok and action == "failed" and ("reset-capped" in detail or "daily_exhausted" in detail), detail
         assert pool.RS1_PATH not in calls, calls
-        assert pool.snapshot()["cards"][0]["resetDayCount"] == 1
+        assert pool.is_card_daily_exhausted("A") is True
+        assert pool.snapshot()["cards"][0]["dailyExhausted"] is True
+
+        # 第三次：直接在内存中跳过，连 /r1 都不打，零网络碰撞！
+        calls.clear()
+        ok, _token, action, _idx, detail = pool.renew_next_card()
+        assert not ok and action == "failed"
+        assert pool.R1_PATH not in calls and pool.RS1_PATH not in calls, calls
 
         # 累计上限独立于当日计数
         p = pool.load_pool()
@@ -474,6 +481,55 @@ def test_history_records_action_and_index():
         assert [h["action"] for h in history] == ["failed", "reset", "renew"], history
         assert history[2]["card"] == "a@x" and history[2]["index"] == 0, history[2]
         assert history[0]["card"] == "" and "无效卡密" in history[0]["message"], history[0]
+
+
+def test_daily_exhaustion_lock_and_next_day_unlock():
+    """单卡换号上限且重置失败后锁死至次日00:00:01，期间零网络碰撞；次日日期变更后自动解冻。"""
+    with tempfile.TemporaryDirectory() as d:
+        _isolate(Path(d))
+        pool.save_pool({
+            "active": 0,
+            "cards": [{"email": "c1@x", "cardCode": "CARD1"}],
+        })
+
+        calls = []
+        def fake(path, code):
+            calls.append((path, code))
+            if path == pool.R1_PATH:
+                return {"success": False, "message": "达到换号上限"}
+            if path == pool.RS1_PATH:
+                return {"success": False, "message": "扣时长重置失败，当日额度已彻底耗尽"}
+            return {"success": True, "token": "X" * 40}
+
+        pool._post = fake
+
+        # 首次换号：触发 R1 -> 换号上限 -> 尝试 RS1 一次 -> 失败 -> 标记今日耗尽
+        ok, _token, action, _idx, detail = pool.renew_next_card()
+        assert not ok and action == "failed", (ok, action)
+        assert pool.is_card_daily_exhausted("CARD1") is True
+        assert pool.are_all_cards_exhausted() is True
+        assert len(calls) == 2, calls  # 1次 r1，1次 rs1
+
+        # 第二次请求：已被锁定为今日耗尽，必须 0 网络调用，绝不再打云端！
+        calls.clear()
+        ok2, _token2, action2, _idx2, detail2 = pool.renew_next_card()
+        assert not ok2 and action2 == "failed"
+        assert len(calls) == 0, f"违反零网络碰撞铁律: {calls}"
+
+        # wait_for_quota_renewal 遇到全池耗尽必须 0ms 快速失败，绝不等待
+        t0 = time.time()
+        wait_res = pool.wait_for_quota_renewal(time.time() * 1000, timeout_s=10)
+        assert wait_res is False
+        assert time.time() - t0 < 0.5, "全池耗尽未即时快速失败"
+
+        # 模拟跨天至次日 00:00:01（日期由今天变为明天）
+        daily = pool.load_daily()
+        daily["date"] = "2020-01-01"  # 模拟前一天
+        pool._write_json(pool.DAILY_FILE, daily)
+
+        # 跨天后自动自愈解锁
+        assert pool.is_card_daily_exhausted("CARD1") is False
+        assert pool.are_all_cards_exhausted() is False
 
 
 if __name__ == "__main__":

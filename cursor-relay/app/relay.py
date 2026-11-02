@@ -1639,6 +1639,9 @@ class _StreamAttempt:
 
 
 def _renew_and_prepare_retry(attempt: int, *, reason: str = "quota") -> None:
+    if are_all_cards_exhausted():
+        print("[kya_llm_proxy] all cards in pool are exhausted/banned; fast-failing immediately", flush=True)
+        raise RuntimeError("All cards exhausted for today. Auto-resets will unlock at 00:00:01.")
     print(
         f"[kya_llm_proxy] {reason} "
         f"(attempt {attempt + 1}/{MAX_QUOTA_RETRIES + 1}); waiting for renew",
@@ -2015,7 +2018,7 @@ def map_proxy_exception(e: Exception, dialect: str = "openai") -> HTTPException:
     if is_quota_err and all_exhausted:
         status_code = 429
         err_type = "insufficient_quota"
-        msg = f"All renewal cards exhausted / Quota limit reached: {msg}"
+        msg = f"All renewal cards exhausted for today. Auto-resets will unlock at 00:00:01 (所有卡密今日额度均已耗尽，请补充新卡密或等待次日 00:00:01 解锁): {msg}"
         headers = {}
     elif is_quota_err and not all_exhausted:
         # 只要卡池中仍有可用备用卡或处于换号重试中，返回 503 引导客户端优雅重试，绝不报 429！

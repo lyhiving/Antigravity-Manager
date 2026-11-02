@@ -165,6 +165,18 @@ async def unban_card(payload: dict) -> dict:
     return pool.snapshot()
 
 
+@app.post("/admin/api/daily-exhausted/clear", dependencies=[Depends(admin_auth)])
+async def clear_daily_exhausted(payload: dict) -> dict:
+    code = str(payload.get("cardCode") or "").strip()
+    if code:
+        pool.clear_card_daily_exhausted(code)
+    else:
+        daily = pool.load_daily()
+        daily["exhaustedCards"] = {}
+        pool._write_json(pool.DAILY_FILE, daily)
+    return pool.snapshot()
+
+
 @app.post("/admin/api/device/reset", dependencies=[Depends(admin_auth)])
 async def reset_device() -> dict:
     if pool.snapshot().get("renewing"):

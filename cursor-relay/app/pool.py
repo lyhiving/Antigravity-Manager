@@ -156,6 +156,47 @@ def unban_card(card_code: str) -> bool:
     return False
 
 
+# -------------------------------------------------- daily exhausted lock mgmt
+def is_card_daily_exhausted(card_code: str) -> bool:
+    """当日是否已达换号上限且无法重置；次日 00:00:01 随日期自然切换自动解冻。"""
+    code = str(card_code or "").strip()
+    if not code:
+        return False
+    daily = load_daily()
+    today = time.strftime("%Y-%m-%d")
+    ex_date = (daily.get("exhaustedCards") or {}).get(code)
+    return ex_date == today
+
+
+def mark_card_daily_exhausted(card_code: str, reason: str = "") -> None:
+    code = str(card_code or "").strip()
+    if not code:
+        return
+    daily = load_daily()
+    if "exhaustedCards" not in daily or not isinstance(daily["exhaustedCards"], dict):
+        daily["exhaustedCards"] = {}
+    today = time.strftime("%Y-%m-%d")
+    daily["exhaustedCards"][code] = today
+    _write_json(DAILY_FILE, daily)
+    masked = code[:3] + "***" + code[-3:] if len(code) > 6 else code
+    detail = f": {reason}" if reason else ""
+    print(
+        f"[cursor-relay] ⛔ 卡密 {masked} 今日换号已达上限并锁定{detail}，"
+        f"锁定至次日 00:00:01 解冻，今日严禁再次向云端碰撞！",
+        flush=True,
+    )
+
+
+def clear_card_daily_exhausted(card_code: str) -> bool:
+    code = str(card_code or "").strip()
+    daily = load_daily()
+    if "exhaustedCards" in daily and code in daily["exhaustedCards"]:
+        del daily["exhaustedCards"][code]
+        _write_json(DAILY_FILE, daily)
+        return True
+    return False
+
+
 def load_pool() -> dict:
     raw = _read_json(CARDS_FILE, {})
     if not isinstance(raw, dict):
@@ -177,7 +218,7 @@ def has_available_backup_cards() -> bool:
     cards = pool.get("cards") or []
     for c in cards:
         code = str(c.get("cardCode") or "").strip()
-        if not code or is_card_banned(code) or card_expired(c):
+        if not code or is_card_banned(code) or card_expired(c) or is_card_daily_exhausted(code):
             continue
         if not reset_capped(c):
             return True
@@ -238,7 +279,9 @@ def load_daily() -> dict:
     raw = _read_json(DAILY_FILE, {})
     today = time.strftime("%Y-%m-%d")
     if not isinstance(raw, dict) or raw.get("date") != today:
-        return {"date": today, "switches": 0, "resets": 0}
+        return {"date": today, "switches": 0, "resets": 0, "exhaustedCards": {}}
+    if "exhaustedCards" not in raw or not isinstance(raw["exhaustedCards"], dict):
+        raw["exhaustedCards"] = {}
     return raw
 
 
@@ -362,7 +405,9 @@ def _ok(res: dict) -> bool:
     return bool(res.get("success")) and len(_token_of(res)) > 20
 
 
-def renew_card(card: dict, allow_reset: bool = True) -> tuple[bool, str, str]:
+def renew_card(
+    card: dict, allow_reset: bool = True, direct_reset: bool = False
+) -> tuple[bool, str, str]:
     """Renew one card. Returns (ok, token, message)；成功且 message=="reset"
     表示走的是扣时长充能重置额度，否则 message 为空串。"""
     code = str(card.get("cardCode") or "").strip()
@@ -373,15 +418,15 @@ def renew_card(card: dict, allow_reset: bool = True) -> tuple[bool, str, str]:
         return False, "", f"banned: 卡密已被封禁 ({reason})"
     if card_expired(card):
         return False, "", "expired: 卡已过期"
+    if is_card_daily_exhausted(code):
+        return False, "", "daily_exhausted: 今日已达换号上限，锁定至次日 00:00:01 解冻"
 
-    res = _post(R1_PATH, code)
-    if res.get("limitReached"):
-        if not allow_reset:
-            return False, "", "limitReached"
+    # 若已确认额度用尽需充能重置，直接发起 /rs1，严禁重复请求 /r1 触发脚本刷号风控
+    if direct_reset:
         blocked = reset_capped(card)
         if blocked:
-            # 本地配额用完就别再打 /rs1，那一步是真扣时长的
-            return False, "", f"reset-capped: {blocked}"
+            mark_card_daily_exhausted(code, blocked)
+            return False, "", f"daily_exhausted: {blocked}"
         write_state(
             "resetting",
             "卡密今日额度已满，正在自动扣时长充能重置额度(+60次)...",
@@ -398,16 +443,52 @@ def renew_card(card: dict, allow_reset: bool = True) -> tuple[bool, str, str]:
             )
             bump_daily("resets")
             return True, _token_of(rs), "reset"
-        msg = str(rs.get("message") or "扣时长重置未通过")
-        if is_permanent_ban_message(msg):
-            mark_card_banned(code, msg)
-        # KYA: 扣时长重置未通过 -> 直接轮换备用卡密，不再重试本卡
-        return False, "", msg
+        rs_msg = str(rs.get("message") or "扣时长重置未通过")
+        if is_permanent_ban_message(rs_msg):
+            mark_card_banned(code, rs_msg)
+        else:
+            mark_card_daily_exhausted(code, f"扣时长重置未通过: {rs_msg}")
+        return False, "", rs_msg
+
+    res = _post(R1_PATH, code)
+    msg = str(res.get("message") or "")
+    is_limit_reached = bool(res.get("limitReached")) or ("达到换号上限" in msg)
+
+    if is_limit_reached:
+        if not allow_reset:
+            return False, "", "limitReached"
+        blocked = reset_capped(card)
+        if blocked:
+            # 本地配额用完就别再打 /rs1，那一步是真扣时长的
+            mark_card_daily_exhausted(code, blocked)
+            return False, "", f"daily_exhausted: {blocked}"
+        write_state(
+            "resetting",
+            "卡密今日额度已满，正在自动扣时长充能重置额度(+60次)...",
+            "requesting_rs1",
+        )
+        rs = _post(RS1_PATH, code)
+        if _ok(rs):
+            today = time.strftime("%Y-%m-%d")
+            same_day = str(card.get("resetDate") or "") == today
+            card["resetCount"] = int(card.get("resetCount") or 0) + 1
+            card["resetDate"] = today
+            card["resetDayCount"] = (
+                int(card.get("resetDayCount") or 0) + 1 if same_day else 1
+            )
+            bump_daily("resets")
+            return True, _token_of(rs), "reset"
+        rs_msg = str(rs.get("message") or "扣时长重置未通过")
+        if is_permanent_ban_message(rs_msg):
+            mark_card_banned(code, rs_msg)
+        else:
+            # 扣时长重置未通过 -> 立即标记今日耗尽，锁定至次日 00:00:01，绝不再重复碰撞
+            mark_card_daily_exhausted(code, f"扣时长重置未通过: {rs_msg}")
+        return False, "", rs_msg
 
     if _ok(res):
         return True, _token_of(res), ""
 
-    msg = str(res.get("message") or "")
     if is_permanent_ban_message(msg):
         mark_card_banned(code, msg)
         return False, "", msg
@@ -420,6 +501,31 @@ def renew_card(card: dict, allow_reset: bool = True) -> tuple[bool, str, str]:
     msg = str(res.get("message") or "云端 API 换号未返回有效凭据")
     if is_permanent_ban_message(msg):
         mark_card_banned(code, msg)
+    elif bool(res.get("limitReached")) or ("达到换号上限" in msg):
+        blocked = reset_capped(card)
+        if blocked:
+            mark_card_daily_exhausted(code, blocked)
+            return False, "", f"daily_exhausted: {blocked}"
+        if allow_reset:
+            rs = _post(RS1_PATH, code)
+            if _ok(rs):
+                today = time.strftime("%Y-%m-%d")
+                same_day = str(card.get("resetDate") or "") == today
+                card["resetCount"] = int(card.get("resetCount") or 0) + 1
+                card["resetDate"] = today
+                card["resetDayCount"] = (
+                    int(card.get("resetDayCount") or 0) + 1 if same_day else 1
+                )
+                bump_daily("resets")
+                return True, _token_of(rs), "reset"
+            rs_msg = str(rs.get("message") or "扣时长重置未通过")
+            if is_permanent_ban_message(rs_msg):
+                mark_card_banned(code, rs_msg)
+            else:
+                mark_card_daily_exhausted(code, f"扣时长重置未通过: {rs_msg}")
+            return False, "", rs_msg
+        else:
+            return False, "", "limitReached"
     return False, "", msg
 
 
@@ -448,7 +554,7 @@ def renew_next_card() -> tuple[bool, str, str, int, str]:
         card = cards[idx]
         code = str(card.get("cardCode") or "").strip()
         label = str(card.get("email") or f"#{idx}")
-        if is_card_banned(code) or card_expired(card):
+        if is_card_banned(code) or card_expired(card) or is_card_daily_exhausted(code):
             continue
         try:
             ok, token, msg = renew_card(card, allow_reset=False)
@@ -474,9 +580,13 @@ def renew_next_card() -> tuple[bool, str, str, int, str]:
     if limit_reached_indices:
         for idx in limit_reached_indices:
             card = cards[idx]
+            code = str(card.get("cardCode") or "").strip()
+            if is_card_banned(code) or card_expired(card) or is_card_daily_exhausted(code):
+                continue
             label = str(card.get("email") or f"#{idx}")
             try:
-                ok, token, msg = renew_card(card, allow_reset=True)
+                # 第一轮已确认限额，直接打 /rs1，绝对不重复请求 /r1 引发脚本刷号封禁
+                ok, token, msg = renew_card(card, allow_reset=True, direct_reset=True)
             except Exception as exc:
                 ok, token, msg = False, "", f"{type(exc).__name__}: {exc}"
             if ok:
@@ -547,6 +657,13 @@ def trigger_quota_switch(session_name: str = "cursor-relay") -> None:
         write_state("skipped", detail, "auto_disabled")
         return
 
+    # 全池耗尽即刻硬熔断：禁止任何网络轮询与并发排队，零碰撞防封
+    if are_all_cards_exhausted():
+        detail = "所有卡密今日额度均已耗尽或被封禁，锁定至次日 00:00:01 解锁，禁止网络碰撞"
+        print(f"[cursor-relay] 🛑 {detail}", flush=True)
+        write_state("error", detail, "all_cards_exhausted", all_exhausted=True)
+        return
+
     now = time.time()
     if _last_switch_at > 0 and (now - _last_switch_at) < COOLDOWN_S:
         remain = int(COOLDOWN_S - (now - _last_switch_at))
@@ -589,6 +706,11 @@ def wait_for_quota_renewal(
     since_ms: float, timeout_s: float = WAIT_TIMEOUT_S
 ) -> bool:
     """Poll the renewal state file until it settles or times out."""
+    # 核心快速失败：全池耗尽时 0ms 立即退出，杜绝无意义等待
+    if are_all_cards_exhausted():
+        print("[cursor-relay] all cards exhausted today; fast-failing without wait", flush=True)
+        return False
+
     since_floor = since_ms - 1000
     deadline = time.time() + timeout_s
     last_log = 0.0
@@ -651,6 +773,7 @@ def snapshot() -> dict:
                 else 0,
                 "expired": card_expired(card),
                 "resetCapped": reset_capped(card),
+                "dailyExhausted": is_card_daily_exhausted(code),
                 "banned": code in banned_map,
                 "bannedReason": banned_map.get(code, {}).get("reason", "") if code in banned_map else "",
                 "active": idx == pool.get("active", 0),
