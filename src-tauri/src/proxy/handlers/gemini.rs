@@ -940,25 +940,16 @@ pub async fn handle_generate(
                                 .into_response());
                         }
                         Err(e) => {
-                            error!("Stream collection error: {}", e);
-                            let error_json = serde_json::json!({
-                                "error": {
-                                    "code": 500,
-                                    "message": format!("Stream collection error: {}", e),
-                                    "status": "INTERNAL"
-                                }
-                            });
-                            return Ok(Response::builder()
-                                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                                .header("Content-Type", "application/json")
-                                .header("X-Account-Email", &email)
-                                .header("X-Mapped-Model", &mapped_model)
-                                .header("X-Upstream-Model", config.final_model.as_str())
-                                .header("X-Session-Id", &client_session_id)
-                                .header("X-Antigravity-Session-Id", &client_session_id)
-                                .body(Body::from(serde_json::to_string(&error_json).unwrap()))
-                                .unwrap()
-                                .into_response());
+                            tracing::warn!(
+                                "[{}] Stream collection error (possibly upstream interrupted): {}, retrying with another account...",
+                                session_id,
+                                e
+                            );
+                            last_error = format!("Stream collection error: {}", e);
+                            failure_statuses.record(StatusCode::BAD_GATEWAY);
+                            token_manager.mark_account_transient_failure(&account_id, 30, &e);
+                            force_rotate = true;
+                            continue;
                         }
                     }
                 }

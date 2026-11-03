@@ -3032,12 +3032,16 @@ pub async fn handle_chat_completions(
                                 .into_response());
                         }
                         Err(e) => {
-                            error!("[{}] Stream collection error: {}", trace_id, e);
-                            return Ok((
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                format!("Stream collection error: {}", e),
-                            )
-                                .into_response());
+                            tracing::warn!(
+                                "[{}] Stream collection error (possibly upstream interrupted): {}, retrying with another account...",
+                                trace_id,
+                                e
+                            );
+                            last_error = format!("Stream collection error: {}", e);
+                            failure_statuses.record(StatusCode::BAD_GATEWAY);
+                            token_manager.mark_account_transient_failure(&account_id, 30, &e);
+                            force_rotate = true;
+                            continue;
                         }
                     }
                 }
