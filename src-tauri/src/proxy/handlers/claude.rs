@@ -1731,6 +1731,9 @@ pub async fn handle_messages(
     let global_deadline = request_start
         + std::time::Duration::from_secs(super::common::MAX_GATEWAY_REQUEST_BUDGET_SECS);
 
+    let client_wants_stream = request.stream;
+    let mut force_stream_internally = !client_wants_stream;
+
     for attempt in 0..max_attempts {
         // [Stage 2 Timing] 中转归一计时起点
         let norm_start = std::time::Instant::now();
@@ -1973,9 +1976,6 @@ pub async fn handle_messages(
         }
 
         // 4. 上游调用 - 自动转换逻辑
-        let client_wants_stream = request.stream;
-        // [AUTO-CONVERSION] 非 Stream 请求自动转换为 Stream 以享受更宽松的配额
-        let force_stream_internally = !client_wants_stream;
         let actual_stream = client_wants_stream || force_stream_internally;
 
         if force_stream_internally {
@@ -2429,12 +2429,14 @@ pub async fn handle_messages(
                             }
                             Err(e) => {
                                 tracing::warn!(
-                                        "[{}] Stream collection error (possibly upstream interrupted): {}, retrying with another account...",
-                                        trace_id,
-                                        e
-                                    );
+                                    "[{}] Stream collection error (upstream stream interrupted): {}, falling back to native unary generateContent...",
+                                    trace_id,
+                                    e
+                                );
                                 last_error = format!("Stream collection error: {}", e);
-                                force_rotate = true;
+                                failure_statuses.record(StatusCode::BAD_GATEWAY);
+                                force_stream_internally = false;
+                                force_rotate = false;
                                 continue;
                             }
                         }

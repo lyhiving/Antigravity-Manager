@@ -164,12 +164,7 @@ pub async fn handle_generate(
     }
     let client_wants_stream = method == "streamGenerateContent";
     // [AUTO-CONVERSION] 强制内部流式化
-    let force_stream_internally = !client_wants_stream;
-    let is_stream = client_wants_stream || force_stream_internally;
-
-    if force_stream_internally {
-        // debug!("[AutoConverter] Converting non-stream request to stream");
-    }
+    let mut force_stream_internally = !client_wants_stream;
 
     // 2. 获取 UpstreamClient 和 TokenManager
     let upstream = state.upstream.clone();
@@ -413,6 +408,7 @@ pub async fn handle_generate(
         }
 
         // 5. 上游调用
+        let is_stream = client_wants_stream || force_stream_internally;
         let query_string = if is_stream { Some("alt=sse") } else { None };
         let upstream_method = if is_stream {
             "streamGenerateContent"
@@ -941,14 +937,21 @@ pub async fn handle_generate(
                         }
                         Err(e) => {
                             tracing::warn!(
-                                "[{}] Stream collection error (possibly upstream interrupted): {}, retrying with another account...",
+                                "[{}] Stream collection error (upstream stream interrupted): {}, falling back to native unary generateContent...",
                                 session_id,
                                 e
                             );
                             last_error = format!("Stream collection error: {}", e);
                             failure_statuses.record(StatusCode::BAD_GATEWAY);
-                            token_manager.mark_account_transient_failure(&account_id, 30, &e);
-                            force_rotate = true;
+                            force_stream_internally = false;
+                            retry_credentials = Some((
+                                access_token.clone(),
+                                project_id.clone(),
+                                email.clone(),
+                                account_id.clone(),
+                                0,
+                            ));
+                            force_rotate = false;
                             continue;
                         }
                     }

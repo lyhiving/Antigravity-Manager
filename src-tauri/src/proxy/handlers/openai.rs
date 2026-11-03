@@ -2344,6 +2344,8 @@ pub async fn handle_chat_completions(
     let mut retried_without_thinking = false;
     let mut retried_with_budget_degraded = false;
     let mut degraded_gemini_body: Option<Value> = None;
+    let client_wants_stream = openai_req.stream;
+    let mut force_stream_internally = !client_wants_stream;
 
     // 2. 模型路由解析 (移到循环外以支持在所有路径返回 X-Mapped-Model)
     let mapped_model = crate::proxy::common::model_mapping::resolve_model_route_with_effort(
@@ -2553,8 +2555,6 @@ pub async fn handle_chat_completions(
         );
 
         // 5. 发送请求
-        let client_wants_stream = openai_req.stream;
-        let force_stream_internally = !client_wants_stream;
         let actual_stream = client_wants_stream || force_stream_internally;
 
         if force_stream_internally {
@@ -3033,14 +3033,21 @@ pub async fn handle_chat_completions(
                         }
                         Err(e) => {
                             tracing::warn!(
-                                "[{}] Stream collection error (possibly upstream interrupted): {}, retrying with another account...",
+                                "[{}] Stream collection error (upstream stream interrupted): {}, falling back to native unary generateContent...",
                                 trace_id,
                                 e
                             );
                             last_error = format!("Stream collection error: {}", e);
                             failure_statuses.record(StatusCode::BAD_GATEWAY);
-                            token_manager.mark_account_transient_failure(&account_id, 30, &e);
-                            force_rotate = true;
+                            force_stream_internally = false;
+                            retry_credentials = Some((
+                                access_token.clone(),
+                                project_id.clone(),
+                                email.clone(),
+                                account_id.clone(),
+                                0,
+                            ));
+                            force_rotate = false;
                             continue;
                         }
                     }
@@ -4327,6 +4334,8 @@ pub async fn handle_completions(
     let mut retry_credentials: Option<(String, String, String, String, u64)> = None;
     let mut failure_statuses = FailureStatusTracker::default();
     let mut used_attempts = 0;
+    let client_wants_stream = openai_req.stream;
+    let mut force_stream_internally = !client_wants_stream;
 
     let clean_ms = clean_start.elapsed().as_micros() as f64 / 1000.0;
     let mut ttft_ms = 0.0f64;
@@ -4544,8 +4553,6 @@ pub async fn handle_completions(
         }
 
         // [AUTO-CONVERSION] For Legacy/Codex as well
-        let client_wants_stream = openai_req.stream;
-        let force_stream_internally = !client_wants_stream;
         let list_response = client_wants_stream || force_stream_internally;
         let method = if list_response {
             "streamGenerateContent"
@@ -5159,11 +5166,23 @@ pub async fn handle_completions(
                                 .into_response();
                         }
                         Err(e) => {
-                            return (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                format!("Stream collection error: {}", e),
-                            )
-                                .into_response();
+                            tracing::warn!(
+                                "[{}] Stream collection error (upstream stream interrupted): {}, falling back to native unary generateContent...",
+                                trace_id,
+                                e
+                            );
+                            last_error = format!("Stream collection error: {}", e);
+                            failure_statuses.record(StatusCode::BAD_GATEWAY);
+                            force_stream_internally = false;
+                            retry_credentials = Some((
+                                access_token.clone(),
+                                project_id.clone(),
+                                email.clone(),
+                                account_id.clone(),
+                                0,
+                            ));
+                            force_rotate = false;
+                            continue;
                         }
                     }
                 }
