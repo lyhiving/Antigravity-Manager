@@ -505,16 +505,19 @@ impl UpstreamClient {
 
     /// 计算上游多端点调用的全链路总超时时间预算（秒）
     ///
-    /// 流式请求响应头基准保底 30s（超大 payload 弹性放宽至 45s），备用回退预算 25s，
-    /// 全链路总预算由原先的 150s 大幅收敛至 55~70s，杜绝主端点在排队拥塞时漫长挂起 85s~140s。
+    /// 流式请求响应头基准对齐 initial_ttft_secs（默认 180s，保底至少 120s），
+    /// 确保大上下文和深度思考（Thinking / Extended CoT）模型在生成首字前享有完整预算，
+    /// 备用回退端点给予 45s 探活预算。非流式请求基准 30s + 回退 15s。
     pub fn calculate_total_upstream_budget_secs(method: &str, body_len: usize) -> u64 {
+        let stream_timeouts = crate::proxy::get_stream_timeout_config();
+        let max_ttft = std::cmp::max(120, stream_timeouts.initial_ttft_secs);
         let base_watchdog = if method == "streamGenerateContent" {
-            std::cmp::min(45, std::cmp::max(30, (body_len as u64) / (64 * 1024) + 30))
+            std::cmp::max(max_ttft, (body_len as u64) / (64 * 1024) + max_ttft)
         } else {
-            std::cmp::min(30, std::cmp::max(15, (body_len as u64) / (256 * 1024) + 15))
+            std::cmp::min(60, std::cmp::max(30, (body_len as u64) / (256 * 1024) + 30))
         };
         let fallback_margin = if method == "streamGenerateContent" {
-            25
+            45
         } else {
             15
         };
@@ -523,9 +526,9 @@ impl UpstreamClient {
 
     /// 动态计算当前端点尝试的看门狗单次超时时长（秒）
     ///
-    /// 1. 首选端点 (attempt_idx == 0): 分配基准响应头看门狗（流式 30s，超大 payload 弹性放宽至 45s），
-    ///    若已确权容量枯竭则极速收敛至 15s；
-    /// 2. 回退备用端点 (attempt_idx > 0): 采用快探活看门狗（流式上限 25s，非流式 15s，容量枯竭 15s）；
+    /// 1. 首选端点 (attempt_idx == 0): 分配基准响应头看门狗（流式请求完整享有 initial_ttft_secs，
+    ///    默认 180s，不低于 120s），若确权容量枯竭则极速收敛至 15s；
+    /// 2. 回退备用端点 (attempt_idx > 0): 采用探活看门狗（流式上限 45s，非流式 30s，容量枯竭 15s）；
     /// 3. 受限于全链路剩余时间预算 `remaining_budget_secs`，并设置 5s 终极保底，防止由于网络开销导致为 0。
     pub fn calculate_endpoint_watchdog_secs(
         method: &str,
@@ -534,10 +537,12 @@ impl UpstreamClient {
         remaining_budget_secs: u64,
         is_capacity_exhausted: bool,
     ) -> u64 {
+        let stream_timeouts = crate::proxy::get_stream_timeout_config();
+        let max_ttft = std::cmp::max(120, stream_timeouts.initial_ttft_secs);
         let base_watchdog = if method == "streamGenerateContent" {
-            std::cmp::min(45, std::cmp::max(30, (body_len as u64) / (64 * 1024) + 30))
+            std::cmp::max(max_ttft, (body_len as u64) / (64 * 1024) + max_ttft)
         } else {
-            std::cmp::min(30, std::cmp::max(15, (body_len as u64) / (256 * 1024) + 15))
+            std::cmp::min(60, std::cmp::max(30, (body_len as u64) / (256 * 1024) + 30))
         };
 
         let target_secs = if is_capacity_exhausted {
@@ -545,9 +550,9 @@ impl UpstreamClient {
         } else if attempt_idx == 0 {
             base_watchdog
         } else if method == "streamGenerateContent" {
-            std::cmp::min(base_watchdog, 25)
+            std::cmp::min(base_watchdog, 45)
         } else {
-            std::cmp::min(base_watchdog, 15)
+            std::cmp::min(base_watchdog, 30)
         };
 
         target_secs.min(remaining_budget_secs).max(5)
@@ -1360,36 +1365,36 @@ mod tests {
 
     #[test]
     fn test_calculate_watchdog_and_budget() {
-        // streamGenerateContent primary attempt with ample budget (recalibrated to 30s base, 55s total)
+        // streamGenerateContent primary attempt with ample budget (aligned with initial_ttft_secs, 180s base, 225s total)
         let total_budget =
             UpstreamClient::calculate_total_upstream_budget_secs("streamGenerateContent", 1024);
-        assert_eq!(total_budget, 55); // 30 + 25
+        assert_eq!(total_budget, 225); // 180 + 45
 
         let wd_primary = UpstreamClient::calculate_endpoint_watchdog_secs(
             "streamGenerateContent",
             1024,
             0,
-            55,
+            225,
             false,
         );
-        assert_eq!(wd_primary, 30);
+        assert_eq!(wd_primary, 180);
 
-        // Fallback attempt (idx > 0) is capped at 25s
+        // Fallback attempt (idx > 0) is capped at 45s
         let wd_fallback = UpstreamClient::calculate_endpoint_watchdog_secs(
             "streamGenerateContent",
             1024,
             1,
-            25,
+            45,
             false,
         );
-        assert_eq!(wd_fallback, 25);
+        assert_eq!(wd_fallback, 45);
 
         // Capacity exhausted attempt is fast-probed at 15s max
         let wd_exhausted = UpstreamClient::calculate_endpoint_watchdog_secs(
             "streamGenerateContent",
             1024,
             1,
-            25,
+            45,
             true,
         );
         assert_eq!(wd_exhausted, 15);
@@ -1414,12 +1419,12 @@ mod tests {
         );
         assert_eq!(wd_min, 5);
 
-        // Non-stream methods have 15s base watchdog and 30s total budget
+        // Non-stream methods have 30s base watchdog and 45s total budget
         let total_non_stream =
             UpstreamClient::calculate_total_upstream_budget_secs("generateContent", 1024);
-        assert_eq!(total_non_stream, 30); // 15 + 15
+        assert_eq!(total_non_stream, 45); // 30 + 15
         let wd_non_stream =
-            UpstreamClient::calculate_endpoint_watchdog_secs("generateContent", 1024, 0, 30, false);
-        assert_eq!(wd_non_stream, 15);
+            UpstreamClient::calculate_endpoint_watchdog_secs("generateContent", 1024, 0, 45, false);
+        assert_eq!(wd_non_stream, 30);
     }
 }
